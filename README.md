@@ -12,11 +12,6 @@ writing messages on its 5 OLED screens.
 
 Your computer talks to Glowbug using this open-source software.
 
-## Who is it for?
-
-People who run a few AI coding agents at once -- Claude Code, Codex, Cursor,
-Antigravity, any mix -- on a Mac.
-
 ## What does it do?
 
 Every running agent gets a screen with its name. The light above it says
