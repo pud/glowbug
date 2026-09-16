@@ -10,12 +10,8 @@ changing color, and writing messages on its 5 OLED screens.
 
 It doesn't have arms and legs yet so it won't run after you.
 
-I built Glowbug because, while I'm waiting for a coding AI (Claude, Codex,
-Cursor, etc) to finish, I might flip over to YouTube or organize a desk in my
-office or something -- then come back to my agent *to find out it's been
-waiting 24 minutes for me to answer some yes/no question*.
-
-Glowbug fixes that.
+I built Glowbug for those times when my coding agent is *waiting for me* but
+I didn't notice. Glowbug fixes that.
 
 When your agent is done, you'll know. Saving valuable, frustrating minutes.
 
