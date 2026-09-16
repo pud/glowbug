@@ -25,11 +25,15 @@ https://glowbug.dev · https://github.com/pud/glowbug · MIT license
 """
 
 import argparse
+import base64
 import collections
+import colorsys
 import glob
 import json
+import math
 import os
 import queue
+import random
 import re
 import select
 import shutil
@@ -42,7 +46,7 @@ import threading
 import time
 import traceback
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 NUM_SLOTS = 5                        # pre-negotiation window (old boards show 5)
 BOARD_SLOTS_MAX = 32                 # protocol v3 cap: fw 1.4.0+ advertises
                                      # "EVT HELLO <fw> PROTO 3 SLOTS 32"; the
@@ -3010,6 +3014,11 @@ def install():
     print()
     print("Glowbug is %s. New sessions will appear on the device."
           % ("ready" if (daemon_ok and port) else "partially set up"))
+    if daemon_ok and port and _wait_board(6.0):
+        try:
+            lightshow()
+        except GlowbugError as e:
+            print("    (light show skipped: %s)" % e.message)
 
 
 def uninstall():
@@ -3461,6 +3470,309 @@ def settings_save():
 
 
 # ---------------------------------------------------------------- the CLI
+# ---------------------------------------------------------------------------
+# Light show — `glowbug lightshow`, and what `glowbug install` plays once the
+# daemon sees the board. Everything here is host-side over the raw API
+# (PROTOCOL.md): the frames are rendered on the Mac and streamed as BLIT
+# pages, LED moves are eased on the board, and one TONE line timed to the
+# frames is the soundtrack. The firmware is frozen — the board's own welcome
+# animation is untouched; this runs whenever a host asks for it.
+#
+# Geometry: the five glasses are 128x32 each, 41 mm apart on the board and
+# ~22.4 mm wide, so an effect that travels "across the bar" moves over a
+# virtual canvas SHOW_W px wide in which only five 128-px windows are
+# visible. A ring or a star crossing the gap between two glasses takes the
+# time it physically should.
+# ---------------------------------------------------------------------------
+
+SHOW_FPS = 18
+SHOW_PITCH = 234                       # px between glass centers (41 mm at 128 px / 22.4 mm)
+SHOW_W = 4 * SHOW_PITCH + 128          # virtual canvas width
+SHOW_CX = 2 * SHOW_PITCH + 64          # the bar's center (middle of glass 3)
+SHOW_VX = [s * SHOW_PITCH + i for s in range(5) for i in range(128)]
+_BITS = [1 << y for y in range(32)]                       # row y -> column bit (LSB = top)
+_ABS_DY = [abs(y - 16) for y in range(32)]
+_BAND = [[sum(_BITS[y] for y in range(32) if a <= _ABS_DY[y] < b)
+          for b in range(18)] for a in range(18)]         # rows with a <= |y-16| < b
+_DITH = ((-1.2, 1.2), (0.4, -0.4))                        # 2x2 ordered thresholds [x&1][y&1]
+
+# the timeline (seconds from the first line)
+SHOW_T_PLASMA = 0.85
+SHOW_T_WARP = 2.15
+SHOW_T_FLASH = 2.95
+SHOW_T_REVEAL = 3.05
+SHOW_T_RAYS_END = 3.65
+SHOW_T_FADE = 4.55
+SHOW_T_END = 5.0
+SHOW_RING_V = 640.0                    # px/s — the ignition wave clears the bar by ~0.9 s
+SHOW_RING_T0 = 0.06                    # when the wave leaves the center
+
+# the soundtrack: 30 notes, 3,720 ms — inside TONE's 32-note / 5,000 ms limits,
+# phrased to the phases above (sweep, twinkles, warp rise, flash + fanfare)
+SHOW_TONE = ("523:50,659:50,831:50,1047:50,1319:50,1661:50,2093:50,2637:50,3322:50,4186:50,"
+             "0:350,"
+             "1319:70,0:190,1760:70,0:190,2093:70,0:190,2637:70,0:450,"
+             "440:160,554:160,659:160,880:160,1109:160,"
+             "4186:60,0:40,2093:90,2637:90,3136:90,4186:400")
+
+
+def show_frame_lines(cols, screens=(0, 1, 2, 3, 4)):
+    """640 column words (five glasses of 128, bit y = row y, LSB = top) ->
+    one `BLIT <glass> ALL <base64>` line per glass in `screens`: the four
+    SSD1306 pages of that glass back to back, 512 bytes, 684 chars."""
+    lines = []
+    for s in screens:
+        seg = cols[s * 128:(s + 1) * 128]
+        data = bytes([(c >> (8 * p)) & 0xFF for p in range(4) for c in seg])
+        lines.append("BLIT %d ALL %s" % (s, base64.b64encode(data).decode()))
+    return lines
+
+
+def _ring_col(dx2, r_in, r_out, mask=0xFFFFFFFF):
+    """The rows of a column at horizontal distance^2 `dx2` from a circle's
+    center that fall inside the annulus r_in <= r < r_out."""
+    hi = r_out * r_out - dx2
+    if hi <= 0:
+        return 0
+    lo = r_in * r_in - dx2
+    a = math.isqrt(lo - 1) + 1 if lo > 0 else 0
+    if a > 17:
+        return 0
+    b = min(17, math.isqrt(hi - 1) + 1)
+    return _BAND[a][b] & mask
+
+
+def _fx_ring(t):
+    """Ignition: the middle glass blooms from a point, then the wave leaves
+    the center and sweeps out through all five glasses — a solid front with
+    an afterglow that decays behind it (50 %, then 25 % dither), so each
+    glass lights up as the wave arrives and fades as it passes."""
+    r = (t - SHOW_RING_T0) * SHOW_RING_V
+    ri = int(r)
+    cols = []
+    for vx in SHOW_VX:
+        dx = vx - SHOW_CX
+        dx2 = dx * dx
+        c = 0
+        if ri > 0:
+            c |= _ring_col(dx2, max(0, ri - 10), ri + 1)
+            c |= _ring_col(dx2, max(0, ri - 52), max(0, ri - 10),
+                           0x55555555 if vx & 1 else 0xAAAAAAAA)
+            c |= _ring_col(dx2, max(0, ri - 120), max(0, ri - 52),
+                           (0x11111111 << (vx & 3)) & 0xFFFFFFFF)
+        elif t > 0:
+            c |= _ring_col(dx2, 0, int(1 + t * 60))          # the point of light
+        cols.append(c)
+    return cols
+
+
+def _fx_plasma(t, fade):
+    """Flowing interference bands (three sines, ordered-dithered to four
+    grey levels). fade 0 = full, 1 = dissolved."""
+    lift = 3.2 * fade
+    fx = [math.sin(vx / 21.0 + 2.4 * t) for vx in SHOW_VX]
+    fy = [math.sin(y / 4.7 - 2.0 * t) for y in range(32)]
+    fd = [math.sin(d / 14.0 + 1.5 * t) for d in range(SHOW_W + 32)]
+    bits = _BITS
+    cols = []
+    for i, vx in enumerate(SHOW_VX):
+        a = fx[i]
+        th0, th1 = _DITH[vx & 1]
+        th0 += lift
+        th1 += lift
+        c = 0
+        for y in range(0, 32, 2):
+            if a + fy[y] + fd[vx + y] > th0:
+                c |= bits[y]
+            if a + fy[y + 1] + fd[vx + y + 1] > th1:
+                c |= bits[y + 1]
+        cols.append(c)
+    return cols
+
+
+def _seg(cols, x0, y0, x1, y1):
+    """Draw a line on the virtual canvas; only the visible windows land."""
+    n = int(abs(x1 - x0)) + 1
+    for k in range(n):
+        f = k / n
+        x = int(x0 + (x1 - x0) * f)
+        y = int(y0 + (y1 - y0) * f)
+        if 0 <= y < 32:
+            s, i = divmod(x, SHOW_PITCH)
+            if 0 <= s < 5 and i < 128:
+                cols[s * 128 + i] |= _BITS[y]
+
+
+def _fx_warp(t, dt, rnd, stars, core):
+    """Starfield warp: stars stream out of the center, accelerating, their
+    streaks lengthening; a core grows at the middle until the flash."""
+    cols = [0] * 640
+    for _ in range(8):
+        ang = rnd.uniform(-0.28, 0.28)
+        side = 1 if rnd.random() < 0.5 else -1
+        v = rnd.uniform(240, 520)
+        stars.append([SHOW_CX + rnd.uniform(-14, 14), 16 + rnd.uniform(-5, 5),
+                      side * math.cos(ang) * v, math.sin(ang) * v, t])
+    alive = []
+    for st in stars:
+        x, y, vx, vy, born = st
+        k = 1 + 3.5 * (t - born)
+        nx, ny = x + vx * k * dt, y + vy * k * dt
+        _seg(cols, x - vx * k * 0.05, y - vy * k * 0.05, nx, ny)
+        st[0], st[1] = nx, ny
+        if abs(nx - SHOW_CX) < 560:
+            alive.append(st)
+    stars[:] = alive
+    if core > 0:
+        rc = int(core)
+        for i, vx in enumerate(SHOW_VX):
+            dx = vx - SHOW_CX
+            if abs(dx) <= rc:
+                cols[i] |= _ring_col(dx * dx, 0, rc,
+                                     0xFFFFFFFF if core >= 9 else
+                                     (0x55555555 if vx & 1 else 0xAAAAAAAA))
+    return cols
+
+
+def _fx_rays(u):
+    """After the flash: light rays on the outer four glasses retract
+    toward the word in the middle. u runs 0..1."""
+    cols = [0] * 640
+    rows = 0x0003C000 if u < 0.5 else 0x00018000       # rows 14-17, then 15-16
+    cut = int(128 * u)
+    for s in (0, 1):
+        for i in range(cut, 128):
+            cols[s * 128 + i] = rows
+    for s in (3, 4):
+        for i in range(0, 128 - cut):
+            cols[s * 128 + i] = rows
+    return cols
+
+
+def _show_rgb(rgb, gain):
+    r, g, b = (rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255
+    return "%02X%02X%02X" % (int(r * gain + 0.5), int(g * gain + 0.5), int(b * gain + 0.5))
+
+
+def _show_hue(h, gain):
+    r, g, b = colorsys.hsv_to_rgb(h % 1.0, 1.0, 1.0)
+    return "%02X%02X%02X" % (int(255 * r * gain + 0.5), int(255 * g * gain + 0.5),
+                             int(255 * b * gain + 0.5))
+
+
+def lightshow_plan(gain=1.0, quiet=False):
+    """The cue list: (t, wire lines), sorted. `gain` scales the colors
+    (flashes are always full white); `quiet` drops the soundtrack."""
+    g, ug = gain, gain * 0.45
+    viol, blue, cyan, amber = 0x8000FF, 0x0040FF, 0x00FFFF, 0xFF6A00
+    hit1 = SHOW_RING_T0 + SHOW_PITCH / SHOW_RING_V      # the wave reaches glasses 2 and 4
+    hit2 = SHOW_RING_T0 + 2 * SHOW_PITCH / SHOW_RING_V  # ... and 1 and 5
+    cues = [
+        (0.0, ["OWN ALL FOR %d" % int((SHOW_T_END + 4) * 1000), "CONTRAST ALL 255",
+               "CLEAR ALL", "LED ALL OFF"]
+              + ([] if quiet else ["TONE " + SHOW_TONE])
+              + ["LED 2 SET FFFFFF", "LED 7 SET " + _show_rgb(0xFFFFFF, 0.5)]),
+        (0.10, ["LED 2 FADE %s 220" % _show_rgb(viol, g), "LED 7 FADE %s 300" % _show_rgb(viol, ug)]),
+        (hit1, ["LED 1,3 SET FFFFFF", "LED 6,8 SET " + _show_rgb(0xFFFFFF, 0.5)]),
+        (hit1 + 0.07, ["LED 1,3 FADE %s 220" % _show_rgb(blue, g), "LED 6,8 FADE %s 300" % _show_rgb(blue, ug)]),
+        (hit2, ["LED 0,4 SET FFFFFF", "LED 5,9 SET " + _show_rgb(0xFFFFFF, 0.5)]),
+        (hit2 + 0.07, ["LED 0,4 FADE %s 220" % _show_rgb(cyan, g), "LED 5,9 FADE %s 300" % _show_rgb(cyan, ug)]),
+        (SHOW_T_WARP, ["LED GLASS FADE 303030 780", "LED UG FADE 101010 780"]),
+        (SHOW_T_FLASH, ["CLEAR ALL", "BIG 2 Glowbug", "INVERT ALL 1", "LED ALL SET FFFFFF"]),
+        (SHOW_T_REVEAL, ["INVERT ALL 0",
+                         "LED GLASS FADE %s 900" % _show_rgb(viol, g),
+                         "LED UG FADE %s 900" % _show_rgb(amber, ug)]),
+        (SHOW_T_FADE, ["LED ALL FADE 000000 400"]),
+        (SHOW_T_END, ["RELEASE ALL"]),
+    ]
+    cues.sort(key=lambda c: c[0])
+    return cues
+
+
+def lightshow_frame(t, gain, rnd, stars, dt=1.0 / SHOW_FPS):
+    """The lines for the frame at time t: BLIT pages and, during the plasma,
+    the rainbow FADE lines. `stars` persists between calls."""
+    lines = []
+    if t < SHOW_T_PLASMA:
+        lines += show_frame_lines(_fx_ring(t))
+    elif t < SHOW_T_FLASH:
+        cols = None
+        if t < SHOW_T_WARP:
+            u = (t - SHOW_T_PLASMA) / (SHOW_T_WARP - SHOW_T_PLASMA)
+            fade = max(0.0, 1 - u / 0.18) if u < 0.18 else max(0.0, (u - 0.78) / 0.22)
+            cols = _fx_plasma(t, fade)
+            lines += ["LED %d FADE %s 70" % (i, _show_hue(0.5 * t + i * 0.12, gain))
+                      for i in range(5)]
+            lines += ["LED %d FADE %s 70" % (5 + i, _show_hue(0.5 * t + i * 0.12, gain * 0.45))
+                      for i in range(5)]
+        if t >= SHOW_T_WARP - 0.35:
+            w = (t - (SHOW_T_WARP - 0.35)) / (SHOW_T_FLASH - SHOW_T_WARP + 0.35)
+            core = 22.0 * max(0.0, (w - 0.45) / 0.55)
+            sc = _fx_warp(t, dt, rnd, stars, core)
+            cols = sc if cols is None else [a | b for a, b in zip(cols, sc)]
+        lines += show_frame_lines(cols)
+    elif SHOW_T_REVEAL <= t < SHOW_T_RAYS_END:
+        u = (t - SHOW_T_REVEAL) / (SHOW_T_RAYS_END - SHOW_T_REVEAL)
+        lines += show_frame_lines(_fx_rays(u), screens=(0, 1, 3, 4))
+    return lines
+
+
+def lightshow(quiet=False):
+    """Play the show on the board through the running daemon. Raises
+    GlowbugError (no_daemon / no_board / proto_too_old) when it can't."""
+    rep = info()
+    b = rep.get("board") or {}
+    if not b.get("online"):
+        raise GlowbugError("no_board", "no Glowbug on USB (is it plugged in?)")
+    if (b.get("proto") or 0) < PROTOCOL_MIN:
+        raise GlowbugError("proto_too_old", "board firmware %s speaks PROTO %s; the light "
+                           "show needs PROTO %d — run `glowbug rescue`"
+                           % (b.get("fw"), b.get("proto"), PROTOCOL_MIN))
+    st = rep.get("settings") or {}
+    gain = max(0.6, min(1.0, (st.get("brightness") or 60) / 100.0))
+    cues = lightshow_plan(gain, quiet)
+    rnd = random.Random(76)
+    stars = []
+    carry = []                                  # cue lines a `busy` reply bounced
+    t0 = time.monotonic()
+    ci = 0
+    while True:
+        t = time.monotonic() - t0
+        lines = list(carry)
+        carry = []
+        while ci < len(cues) and cues[ci][0] <= t:
+            lines += cues[ci][1]
+            ci += 1
+        n_cue = len(lines)
+        lines += lightshow_frame(t, gain, rnd, stars)
+        if lines:
+            try:
+                raw(*lines)
+            except GlowbugError as e:
+                if e.code != "busy":
+                    raise
+                carry = lines[:n_cue]           # frames may drop; cues may not
+        if ci >= len(cues):
+            return True
+        nxt = t0 + t + 1.0 / SHOW_FPS
+        time.sleep(max(0.0, nxt - time.monotonic()))
+
+
+def _wait_board(seconds):
+    """After install: give the freshly started daemon a moment to open the
+    port and hear the board. True when a PROTO 4 board is online."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        try:
+            b = info().get("board") or {}
+            if b.get("online"):
+                return (b.get("proto") or 0) >= PROTOCOL_MIN
+        except GlowbugError:
+            pass
+        time.sleep(0.3)
+    return False
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="glowbug",
@@ -3479,6 +3791,9 @@ def build_parser():
                         ("rescue", "reflash firmware (works even on a \"bricked\" board)"),
                         ("version", "print the version")):
         sub.add_parser(name, help=help_)
+
+    s = sub.add_parser("lightshow", help="play the light show (what install plays on the board)")
+    s.add_argument("--quiet", action="store_true", help="no sound")
 
     def api(name, help_):
         sp = sub.add_parser(name, help=help_)
@@ -3687,6 +4002,13 @@ def main(argv=None):
         return 0
     if cmd == "events":
         return _cli_events(args)
+    if cmd == "lightshow":
+        try:
+            lightshow(quiet=args.quiet)
+        except GlowbugError as e:
+            sys.stderr.write("glowbug: %s\n" % e.message)
+            return 3 if e.code == "no_daemon" else 1
+        return 0
     try:
         req = _cli_request(args)
     except GlowbugError as e:                # usage, caught before the daemon

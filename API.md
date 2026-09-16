@@ -117,6 +117,16 @@ glowbug raw "LED 7 SET FF00FF" --confirm
 Exit codes: `0` ok · `1` the daemon refused (the reason on stderr, the
 `error` code in `--json`) · `2` usage · `3` no daemon.
 
+**`lightshow`** — the five-second show `glowbug install` plays when it first
+sees the board: a wave of light through all five screens, flowing plasma
+under a rainbow, a starfield warp, a white flash, and the name. Host-rendered
+frames over the raw API, so it costs the firmware nothing. `--quiet` drops
+the soundtrack. Everything it claims is released at the end.
+
+```sh
+glowbug lightshow
+```
+
 ## Colors and sounds
 
 A color is a name, `#RGB`, `#RRGGBB` or `RRGGBB`. Built-in names: `off

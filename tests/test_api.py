@@ -10,6 +10,7 @@ rescue image gate are checked in-process.
     python3 -m unittest discover -s tests -v
 """
 
+import base64
 import io
 import json
 import os
@@ -921,7 +922,8 @@ class CliTests(ApiCase):
                      ["raw", "PING", "INFO", "--confirm"], ["own", "led:1", "--for", "2"],
                      ["release"], ["events", "--filter", "enc,click"], ["info", "--json"],
                      ["palette", "--reload"], ["settings", "get"],
-                     ["settings", "set", "flip", "1"], ["settings", "save"]):
+                     ["settings", "set", "flip", "1"], ["settings", "save"],
+                     ["lightshow"], ["lightshow", "--quiet"]):
             self.assertEqual(p.parse_args(argv).cmd, argv[0], argv)
         for argv in (["bogus"], ["show"], ["led", "1"], ["sound"], ["raw"],
                      ["settings", "reset"], ["show", "3", "--mode", "wobble"],
@@ -1136,3 +1138,90 @@ class PercentInTextTests(unittest.TestCase):
         self.assertEqual(lines, ["BIG 0 100%", "BIG 4 100%"])
         lines, _ = glowbug.compose_text_lines(["1"], {"line1": ""})
         self.assertEqual(lines, ["CLEAR 1"])
+
+
+class LightshowTests(unittest.TestCase):
+    """`glowbug lightshow` is pure host code over the raw API: every line it
+    can send must pass the raw gate, fit the wire limits, and the frames
+    must map rows to SSD1306 pages the way PROTOCOL.md says."""
+
+    def test_frame_lines_are_page_blits(self):
+        cols = [0] * 640
+        cols[3 * 128 + 5] = 1 << 9          # glass 4, column 5, row 9 -> page 1 bit 1
+        cols[0] = 0xFFFFFFFF                # glass 1, column 0, every row
+        lines = glowbug.show_frame_lines(cols)
+        self.assertEqual(len(lines), 5)
+        for s, line in enumerate(lines):
+            self.assertTrue(line.startswith("BLIT %d ALL " % s), line)
+            b64 = line.split()[3]
+            self.assertEqual(len(b64), 684)
+            data = base64.b64decode(b64, validate=True)
+            self.assertEqual(len(data), 512)
+            if s == 3:
+                self.assertEqual(data[128 * 1 + 5], 0x02)
+                self.assertEqual(sum(data), 0x02)
+            elif s == 0:
+                self.assertEqual([data[p * 128] for p in range(4)], [0xFF] * 4)
+                self.assertEqual(sum(data), 4 * 0xFF)
+            else:
+                self.assertEqual(sum(data), 0)
+        glowbug.check_raw_lines(lines)
+        self.assertEqual([l.split()[1] for l in glowbug.show_frame_lines(cols, screens=(0, 1, 3, 4))],
+                         ["0", "1", "3", "4"])
+
+    def test_plan_fits_the_wire(self):
+        for quiet in (False, True):
+            cues = glowbug.lightshow_plan(gain=0.6, quiet=quiet)
+            times = [t for t, _ in cues]
+            self.assertEqual(times, sorted(times))
+            self.assertEqual(times[0], 0.0)
+            self.assertLessEqual(times[-1], 5.5)
+            self.assertEqual(cues[-1][1], ["RELEASE ALL"])
+            self.assertTrue(cues[0][1][0].startswith("OWN ALL FOR "))
+            tones = []
+            for _, lines in cues:
+                glowbug.check_raw_lines(lines)
+                for line in lines:
+                    verb = line.split()[0]
+                    self.assertIn(verb, ("OWN", "RELEASE", "LED", "TONE", "CLEAR", "BIG",
+                                         "INVERT", "CONTRAST"), line)
+                    if verb == "LED":
+                        self.assertRegex(line, r"^LED (\d|\d,\d|ALL|GLASS|UG) (SET [0-9A-F]{6}|"
+                                               r"FADE [0-9A-F]{6} \d+|OFF)$")
+                    if verb == "TONE":
+                        tones.append(line)
+            self.assertEqual(len(tones), 0 if quiet else 1)
+            if tones:
+                notes = glowbug.parse_notes(tones[0][5:])
+                self.assertLessEqual(len(notes), 32)
+                self.assertLessEqual(sum(ms for _, ms in notes), 5000)
+                for hz, ms in notes:
+                    self.assertTrue(hz == 0 or 50 <= hz <= 20000, hz)
+                    self.assertTrue(1 <= ms <= 5000, ms)
+
+    def test_frames_render_across_the_show(self):
+        import random
+        rnd, stars = random.Random(1), []
+        lit = {}
+        t = 0.0
+        while t < glowbug.SHOW_T_END + 0.2:
+            lines = glowbug.lightshow_frame(t, 0.8, rnd, stars)
+            if lines:
+                glowbug.check_raw_lines(lines)
+            self.assertLessEqual(len(lines), 15)
+            for line in lines:
+                if line.startswith("BLIT"):
+                    lit[round(t, 2)] = lit.get(round(t, 2), 0) + sum(
+                        base64.b64decode(line.split()[3]))
+                else:
+                    self.assertRegex(line, r"^LED \d FADE [0-9A-F]{6} 70$")
+            t += 1.0 / glowbug.SHOW_FPS
+        # something is on the glass in every visual phase, nothing after the rays
+        self.assertTrue(any(v for k, v in lit.items() if 0.2 <= k < 0.8))
+        self.assertTrue(any(v for k, v in lit.items() if 1.0 <= k < 2.0))
+        self.assertTrue(any(v for k, v in lit.items() if 2.3 <= k < 2.9))
+        self.assertTrue(any(v for k, v in lit.items() if 3.1 <= k < 3.6))
+        self.assertFalse(any(k >= glowbug.SHOW_T_RAYS_END for k in lit))
+        # the middle glass keeps its BIG text while the rays play
+        for line in glowbug.lightshow_frame(3.3, 0.8, rnd, stars):
+            self.assertNotEqual(line.split()[1], "2")
