@@ -95,8 +95,8 @@ Give each job its own screen, pass `--for` so signals expire instead of
 squatting, and watch `glowbug events --filter own` to see who claims what.
 
 **`busy`** — the daemon is protecting the board: its outgoing queue is full
-(the board isn't keeping up — ~25-30 full-board frames per second is the
-ceiling), 64 connections are already open, 16 event streams are already
+(the board isn't keeping up — about 20 full-board frames per second is the
+measured ceiling), 64 connections are already open, 16 event streams are already
 open, or your `events` reader let 256 events pile up (the stream ends with
 a `busy` line). Wait a moment and retry; slow your frame rate.
 
@@ -150,15 +150,11 @@ firmware is broken: as long as the device gets power, this works.
 
 **4.** Keep holding for two more seconds, then let go.
 
-The middle screen will read:
-
-```
-   RESCUE MODE
-   Ready for update
-```
-
-No welcome animation, no lights — just that. It means the Glowbug is waiting
-for new firmware. (If the screens stay completely blank, see the last section.)
+Nothing visible happens: no welcome animation, no lights, the screens stay
+dark. That *is* rescue mode — the Glowbug is waiting for new firmware, and
+`glowbug rescue` will report that it sees the device. (Boards still on
+firmware 1.4.x show "RESCUE MODE / Ready for update" on the middle screen
+instead; since 2.0.0 the rescue path runs before anything can draw.)
 
 **5.** With it still plugged in, run:
 
@@ -188,7 +184,7 @@ into `~/.glowbug/firmware.bin`.
 ## Why does this exist?
 
 Firmware updates normally happen over the USB cable, with the Glowbug's own
-software cooperating (that's the "UPDATING / do not unplug" screen you see
+software cooperating (that's the "Updating... / Do not unplug" screen you see
 during a normal update): your Mac says "time to update," the Glowbug steps aside,
 and new firmware is written.
 
@@ -198,10 +194,18 @@ device unable to talk over USB, your Mac can't reach it anymore, so the normal
 update can't rescue it either. Without an escape hatch, a $0.02 software mistake
 would mean opening the case.
 
-Rescue Mode skips the firmware entirely. Holding the knob at power-up talks to a
-tiny program burned into the processor at the factory that cannot be erased,
-overwritten, or broken by anything we ship. It's the same idea as holding a
-button while powering on a phone to reach its recovery screen.
+Rescue Mode skips the firmware entirely. The first 2 KB of the chip hold a
+tiny bootloader that runs before anything else and is never rewritten by a
+normal update. At power-up it checks the knob; if the knob is held, it hands
+the device to a recovery program burned into the processor at the factory that
+cannot be erased, overwritten, or broken by anything we ship. It's the same
+idea as holding a button while powering on a phone to reach its recovery
+screen.
+
+The bootloader also does this on its own: if the firmware fails its integrity
+check, or crashes three times in a row, the device lands in rescue mode with
+nobody touching the knob — so a board that looks dead after a bad update is
+usually already waiting for `glowbug rescue`.
 
 You will probably never need it. It's a seatbelt.
 
@@ -209,9 +213,11 @@ You will probably never need it. It's a seatbelt.
 
 ## Rescue Mode didn't work either
 
-If you don't get the RESCUE MODE screen, the device isn't reaching that code at
-all — which usually means it isn't getting power (bad cable/port) rather than a
-firmware problem. Recheck the cable first.
+If `glowbug rescue` ends with "Never saw the device in rescue mode", the Mac
+isn't seeing the device at all — which usually means it isn't getting power or
+data (bad cable/port) rather than a firmware problem. Recheck the cable first.
+To look for yourself: while the Glowbug is in rescue mode, `dfu-util -l` lists
+a device with id `0483:df11`.
 
 If you've confirmed a known-good data cable and it's still unreachable, get in
 touch — that one needs the case opened, and we'd rather do it than have you

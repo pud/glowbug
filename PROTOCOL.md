@@ -145,8 +145,8 @@ may `SET volume <n>` (RAM only) first if it must be heard.
 
 - LED frames are rendered at 125 Hz; fade/pulse/blink periods below 16 ms are refused.
 - A full repaint of one glass takes about 6 ms of I2C; the board keeps servicing USB between
-  the pages of a `BLIT … ALL`, so a host streaming all five glasses reaches roughly 25-30
-  full-board frames per second (the conformance run records the measured figure).
+  the pages of a `BLIT … ALL`, so a host streaming all five glasses reaches roughly 18-23
+  full-board frames per second (measured by the conformance run on fw 2.0.0).
 - The device menu's open/close animations block the board for about 0.5 s; lines sent
   meanwhile queue in the board's 512 B USB buffer and are processed afterwards.
 - `SAVE` is limited to one flash write per 10 s; the settings page is rated for 10,000 writes.

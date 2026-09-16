@@ -3248,7 +3248,7 @@ def rescue():
     3. While holding, plug the USB-C cable back in.
     4. Keep holding two more seconds, then let go.
 
-The middle screen will read RESCUE MODE. Waiting up to 60s...""")
+Nothing lights up in rescue mode — that's normal. Waiting up to 60s...""")
                 deadline = time.time() + 60
             while not _dfu_present():
                 if time.time() > deadline:
