@@ -9,12 +9,14 @@ changing color, and writing messages on its 5 OLED screens.
 
 It doesn't have arms and legs yet so it won't run after you.
 
-I don't know how you use coding agents (like Claude Code, Codex or Cursor).
-But when I'm waiting for it to finish something, I might flip over to YouTube
-or organize a desk in my office or whatever -- then come back to my agent to
-find out it's been waiting 24 minutes for me to answer some yes/no question.
+I built Glowbug because, while I'm waiting for a coding AI (Claude, Codex,
+Cursor, etc) to finish, I might flip over to YouTube or organize a desk in my
+office or something -- then come back to my agent *to find out it's been
+waiting 24 minutes for me to answer some yes/no question*.
 
-Glowbug fixes that. When your agent is done, you'll know.
+Glowbug fixes that.
+
+When your agent is done, you'll know. Saving valuable, frustrating minutes.
 
 Physically it is a machined aluminum bar about 25 cm long, with five small
 OLED screens, ten lights (five above the screens, five underneath as an
