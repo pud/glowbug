@@ -59,30 +59,14 @@ any language. Reference: [API.md](API.md). Scripts to start from:
 
 ## How do I set it up?
 
-First you need a Glowbug:
-
-[![Buy a Glowbug](docs/buy.svg)](https://glowbug.dev)
-
-Then the software. Any of these:
-
-```text
-Install glowbug from github.com/pud/glowbug        (tell Claude Code)
-```
-
-```sh
-brew install pud-blip/tap/glowbug && glowbug install
-```
-
-```sh
-pipx install glowbug && glowbug install
-```
-
-```sh
-git clone https://github.com/pud/glowbug && cd glowbug && python3 glowbug.py install
-```
-
-Plug in the Glowbug and restart any agent sessions you already had open.
-`glowbug status` tells you if it's healthy.
+- [<ins>Buy a Glowbug device</ins>](https://glowbug.dev)
+- Install the software, any of these ways:
+  - Tell Claude Code: `Install glowbug from github.com/pud/glowbug`
+  - `brew install pud-blip/tap/glowbug && glowbug install`
+  - `pipx install glowbug && glowbug install`
+  - `git clone https://github.com/pud/glowbug && cd glowbug && python3 glowbug.py install`
+- Plug in the Glowbug and restart any agent sessions you already had open.
+  `glowbug status` tells you if it's healthy.
 
 ## How does it work?
 
