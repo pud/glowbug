@@ -1,6 +1,6 @@
 # Glowbug examples
 
-Small, runnable scripts that use the host API (README "API",
+Small, runnable scripts that use the host API ([API.md](../API.md),
 [PROTOCOL.md](../PROTOCOL.md)). Each one uses only flags and functions that
 exist in `glowbug.py` 2.0.0, and every paint carries `--for` / `seconds=`,
 so a dead script never leaves a stale light on the desk.

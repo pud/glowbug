@@ -195,4 +195,4 @@ Names for colors and sounds are resolved by the daemon from its palette (`glowbu
 why the tables can grow without a firmware change. `events` streams the board's events as JSON
 lines; the daemon also synthesizes `board` (online/offline) and `redraw` (after it restored
 your owned glasses following a menu or a re-enumeration — resend animated content). Full
-request/response shapes: README "API" and the `glowbug` module docstrings.
+request/response shapes: [API.md](API.md) and the `glowbug` module docstrings.
