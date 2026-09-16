@@ -4,7 +4,7 @@
 
 [![Buy a Glowbug](docs/buy.svg)](https://glowbug.dev)
 
-## What is it?
+## What is Glowbug?
 
 Glowbug is a device that enables AI coding agents (Claude Code, Codex,
 Cursor, etc.) to get your attention by beeping, flashing, changing color, and
