@@ -18,10 +18,14 @@ Glowbug fixes that.
 When your agent is done, it'll let you know. Either subtly ...or loud and
 annoyingly (you set the rules).
 
-Physically, it's a machined aluminum bar about 25 cm long. Five little OLED
-screens, ten lights (five above the screens, five underneath for a glow) and
-one knob. This repo is the software that runs on your Mac. It's one Python
-file.
+Physically, it's a machined aluminum bar about 25 cm long. Five small,
+1-color OLED screens, ten RGB lights (5 on top, above the screens; 5 on the
+bottom), and one clickable-knob (to access menu/settings).
+
+The code on this page is the part that runs on your computer. The code is
+simple, invisible (runs in the background), and open-source. Glowbug or any
+of its software/firmware has NO access to the internet -- no spying, no
+phoning home, no information at all leaves your computer.
 
 ## Who is it for?
 
