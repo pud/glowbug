@@ -10,6 +10,8 @@ Glowbug is a device that enables AI coding agents (Claude Code, Codex,
 Cursor, etc.) to get your attention by beeping, flashing, changing color, and
 writing messages on its 5 OLED screens.
 
+Your computer talks to Glowbug using this open-source software.
+
 ## Who is it for?
 
 People who run a few AI coding agents at once -- Claude Code, Codex, Cursor,
