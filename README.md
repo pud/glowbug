@@ -6,30 +6,9 @@
 
 ## What is it?
 
-Glowbug is a robot (if you can call it that) that connects to your computer
-via USB.
-
-It helps AI coding agents get your attention by beeping, flashing lights,
-changing color, and writing messages on its 5 OLED screens.
-
-It doesn't have arms and legs yet so it won't run after you.
-
-I built Glowbug for those times when my coding agent is *waiting for me* but
-I didn't notice.
-
-Glowbug fixes that.
-
-When your agent is done, it'll let you know. Either subtly ...or loud and
-annoyingly (you set the rules).
-
-Physically, it's a machined aluminum bar about 25 cm long. Five small,
-1-color OLED screens, ten RGB lights (5 on top, above the screens; 5 on the
-bottom), and one clickable-knob (to access menu/settings).
-
-The code on this page is the part that runs on your computer (think of it
-like a driver). The code is simple, invisible (runs in the background), and
-open-source. Glowbug does not have access to the internet and can't see what
-you're doing; think of it as another peripheral like your monitor or mouse.
+Glowbug is a device that enables AI coding agents (Claude Code, Codex,
+Cursor, etc.) to get your attention by beeping, flashing, changing color, and
+writing messages on its 5 OLED screens.
 
 ## Who is it for?
 
