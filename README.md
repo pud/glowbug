@@ -1,14 +1,23 @@
 # Glowbug
 
-A machined aluminum bar that shows your coding-agent sessions. Five small
-screens, ten lights, one knob. It sits on the desk and tells you, from across
-the room, which agent is thinking, which one needs you, and which one just
-finished.
+If you run AI coding agents, you know the problem: three or four of them are
+working in different windows, and the one that has stopped to ask you a
+question is the one you aren't looking at.
 
-Works with [Claude Code](https://claude.com/claude-code), [Cursor](https://cursor.com),
+Glowbug is a small desk device that fixes that. It plugs into your Mac over
+USB and shows what each agent is doing right now, one agent per screen, with
+a light above each screen that you can read from across the room: thinking,
+waiting for your answer, waiting for permission, just finished. You stop
+cycling through windows; you glance at the bar.
+
+Physically it is a machined aluminum bar about 25 cm long, with five small
+OLED screens, ten lights (five above the screens, five underneath as an
+ambient glow) and one knob. This repository is the host side: the software
+that runs on the Mac, a single Python file.
+
+It works with [Claude Code](https://claude.com/claude-code), [Cursor](https://cursor.com),
 [Codex](https://developers.openai.com/codex) and [Antigravity](https://antigravity.google),
-in any mix. Each session gets a screen. More than five sessions and the row
-scrolls; the knob moves it.
+in any mix. More than five sessions and the row scrolls; the knob moves it.
 
 | light | meaning |
 |---|---|
