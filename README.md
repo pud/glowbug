@@ -18,7 +18,7 @@ writing messages on its 5 OLED screens.
 
 Any one of these:
 
-Tell Claude Code:
+Tell your coding agent (Claude Code, etc.):
 ```
 Install glowbug from github.com/pud/glowbug
 ```
