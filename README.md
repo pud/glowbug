@@ -90,7 +90,7 @@ Glowbug daemon listens to these hooks and tells the Glowbug device what to do
 - The device only ever gets a session's name and one status word.
 - The physical Glowbug device is not connected to the internet.
 
-## If something goes wrong
+## Resetting the Glowbug device
 
 `glowbug rescue` puts the known-good firmware back over USB, even on a board
 that has stopped talking (hold the knob while plugging in). Everything else:
