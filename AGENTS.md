@@ -122,10 +122,11 @@ or a bricked one (user holds the knob while plugging in → ROM bootloader →
 "RESCUE MODE" on the middle screen). Requires dfu-util (`brew install
 dfu-util`). The command never touches the network — if the image is missing
 it prints a curl command for the user to run. Since firmware 2.0.0 it
-writes only the app region (`0x08000800` onward — page 0 is a resident
-bootloader it never touches) and refuses any file that isn't a Glowbug app
-image (no `GLWA` magic at offset `0xC0`), including the old whole-flash
-1.4.x `glowbug.bin`.
+writes the boot+app production image from the start of flash (page 0 holds
+a resident bootloader; rewriting it with the identical frozen copy is safe,
+and it is what upgrades a 1.4.x board) and refuses any file that isn't a
+Glowbug production image (no `GLWB` id at offset `0xC0` / no `GLWA` manifest
+at `0x8C0`), including the old whole-flash 1.4.x `glowbug.bin`.
 
 **When firmware is updated:** rebuild in the (private) firmware tree, then
 refresh all three files here — `cp firmware.bin firmware/glowbug.bin`, update

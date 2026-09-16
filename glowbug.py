@@ -42,7 +42,7 @@ import threading
 import time
 import traceback
 
-VERSION = "1.5.0"
+VERSION = "2.0.0"
 NUM_SLOTS = 5                        # pre-negotiation window (old boards show 5)
 BOARD_SLOTS_MAX = 32                 # protocol v3 cap: fw 1.4.0+ advertises
                                      # "EVT HELLO <fw> PROTO 3 SLOTS 32"; the
@@ -3116,38 +3116,52 @@ DFU_ID = "0483:df11"          # STM32 ROM bootloader, all families
 FW_RAW_URL = "https://raw.githubusercontent.com/pud/glowbug/main/firmware/glowbug.bin"
 
 # Flash map since fw 2.0.0: page 0 (2 KB at 0x08000000) is a resident
-# bootloader the daemon NEVER writes; the app lives at 0x08000800 and ends
-# where the settings page starts. An app image announces itself with the
-# manifest magic "GLWA" (47 4C 57 41) at offset 0xC0, right after its
-# 48-entry vector table.
-APP_FLASH_ADDR = 0x08000800
+# bootloader, the app lives at 0x08000800 and ends where the settings page
+# starts. The image the daemon carries and flashes is the PRODUCTION image:
+# bootloader (padded to 2 KB) + app, written in one pass at 0x08000000 —
+# that is what makes it work on a fresh-from-factory board AND on a 1.4.x
+# board that has no bootloader yet, and on a 2.0.0 board it simply rewrites
+# the identical frozen bootloader. The image announces itself twice: the
+# bootloader id "GLWB" at 0xC0 (after its 48-entry vector table) and the
+# app manifest "GLWA" at 0x800 + 0xC0 (after the app's).
+FLASH_ADDR = 0x08000000
+BOOT_LEN = 0x800
+APP_FLASH_ADDR = FLASH_ADDR + BOOT_LEN
 APP_FLASH_END = 0x0800F800
+BOOT_MAGIC = b"GLWB"
 APP_MAGIC = b"GLWA"
-APP_MAGIC_OFFSET = 0xC0
+MAGIC_OFFSET = 0xC0
 
 
-def check_app_image(path):
-    """None if `path` is a Glowbug APP image safe to flash at
-    APP_FLASH_ADDR, else the reason it is not. Refuses a whole-flash 1.4.x
-    image, a combined production image (both start with the bootloader's
-    vectors, not GLWA at 0xC0) and anything else that would overwrite
-    page 0 or land its reset vector outside the app region."""
+def check_rescue_image(path):
+    """None if `path` is a Glowbug PRODUCTION image (bootloader + app) safe
+    to flash at FLASH_ADDR, else the reason it is not. Refuses the old
+    whole-flash 1.4.x image (no GLWB/GLWA marks), an app-only image (it
+    would land in page 0), and anything whose app reset vector points
+    outside the app region or that runs into the settings page."""
     try:
         with open(path, "rb") as f:
             data = f.read()
     except OSError as e:
         return "unreadable (%s)" % e
-    if len(data) < APP_MAGIC_OFFSET + len(APP_MAGIC):
+    if len(data) < BOOT_LEN + MAGIC_OFFSET + len(APP_MAGIC):
         return "too small (%d bytes)" % len(data)
-    if data[APP_MAGIC_OFFSET:APP_MAGIC_OFFSET + len(APP_MAGIC)] != APP_MAGIC:
-        return 'no "GLWA" app magic at offset 0x%X' % APP_MAGIC_OFFSET
-    if len(data) > APP_FLASH_END - APP_FLASH_ADDR:
-        return "%d bytes does not fit the app region (%d)" % (
-            len(data), APP_FLASH_END - APP_FLASH_ADDR)
-    vec = int.from_bytes(data[4:8], "little") & ~1
+    if data[MAGIC_OFFSET:MAGIC_OFFSET + 4] != BOOT_MAGIC:
+        if data[MAGIC_OFFSET:MAGIC_OFFSET + 4] == APP_MAGIC:
+            return "app-only image (GLWA at 0xC0) — rescue needs the boot+app production image"
+        return 'no "GLWB" bootloader id at offset 0x%X' % MAGIC_OFFSET
+    if data[BOOT_LEN + MAGIC_OFFSET:BOOT_LEN + MAGIC_OFFSET + 4] != APP_MAGIC:
+        return 'no "GLWA" app manifest at offset 0x%X' % (BOOT_LEN + MAGIC_OFFSET)
+    if len(data) > APP_FLASH_END - FLASH_ADDR:
+        return "%d bytes runs into the settings page (max %d)" % (
+            len(data), APP_FLASH_END - FLASH_ADDR)
+    vec = int.from_bytes(data[BOOT_LEN + 4:BOOT_LEN + 8], "little") & ~1
     if not APP_FLASH_ADDR <= vec < APP_FLASH_END:
-        return "reset vector 0x%08X is outside the app region" % vec
+        return "app reset vector 0x%08X is outside the app region" % vec
     return None
+
+
+check_app_image = check_rescue_image   # name used by older notes
 
 
 def _dfu_present():
@@ -3200,13 +3214,14 @@ def rescue():
                  "        %s\n\nthen re-run: glowbug rescue"
                  % (APP_DIR, APP_DIR, FW_RAW_URL))
     print("==> Firmware image: %s (fw %s)" % (fw, fw_ver))
-    why = check_app_image(fw)
+    why = check_rescue_image(fw)
     if why:
         sys.exit("Refusing to flash %s: %s.\n\n"
-                 "rescue writes only the APP region (0x%08X..) — page 0 is the\n"
-                 "bootloader and is never touched. Fetch the current app image:\n\n"
+                 "rescue writes the boot+app production image at 0x%08X (the\n"
+                 "bootloader is frozen, so rewriting it is safe on every board).\n"
+                 "Fetch the current image:\n\n"
                  "    curl -fsSL -o %s/firmware.bin %s\n\nthen re-run: glowbug rescue"
-                 % (fw, why, APP_FLASH_ADDR, APP_DIR, FW_RAW_URL))
+                 % (fw, why, FLASH_ADDR, APP_DIR, FW_RAW_URL))
 
     daemon_was_loaded = os.path.exists(PLIST_PATH)
     if daemon_was_loaded:
@@ -3244,7 +3259,7 @@ The middle screen will read RESCUE MODE. Waiting up to 60s...""")
         print("==> Rescue mode detected — writing firmware (~10s)...")
         try:
             r = subprocess.run(
-                ["dfu-util", "-a", "0", "-s", "0x%08X:leave" % APP_FLASH_ADDR,
+                ["dfu-util", "-a", "0", "-s", "0x%08X:leave" % FLASH_ADDR,
                  "-D", fw],
                 capture_output=True, text=True, timeout=90)
             out = r.stdout + r.stderr

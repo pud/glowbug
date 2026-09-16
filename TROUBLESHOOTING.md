@@ -170,14 +170,18 @@ That reinstalls the last known-good firmware. About ten seconds later, the
 welcome animation plays and you're back to normal.
 
 Since firmware 2.0.0 the first 2 KB of the chip (page 0) hold a small
-resident bootloader, and `glowbug rescue` never writes there — it flashes
-only the app region that starts right after it. Before it touches the board
-it checks the image: a file that isn't a Glowbug **app** image (no `GLWA`
-mark at offset `0xC0`, or a reset vector outside the app region) is refused
-with `Refusing to flash … page 0 is the bootloader and is never touched`,
-and nothing is written. The old whole-flash 1.4.x `glowbug.bin` is refused
-for the same reason; the message includes the `curl` line that fetches the
-current app image into `~/.glowbug/firmware.bin`.
+resident bootloader, and the app lives right after it. The image `glowbug
+rescue` carries is the **production image** — bootloader plus app — written
+in one pass from the start of flash. That is what makes rescue work on every
+board: a fresh one from the factory, a 1.4.x board that has no bootloader
+yet, and a 2.0.0 board (where it simply rewrites the identical, frozen
+bootloader). Before it touches the board it checks the image: a file that
+isn't a Glowbug production image (no `GLWB` bootloader id at offset `0xC0`,
+no `GLWA` app manifest at `0x8C0`, an app-only image, or an app reset vector
+outside the app region) is refused with `Refusing to flash …`, and nothing
+is written. The old whole-flash 1.4.x `glowbug.bin` is refused for the same
+reason; the message includes the `curl` line that fetches the current image
+into `~/.glowbug/firmware.bin`.
 
 ---
 

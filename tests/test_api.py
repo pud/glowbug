@@ -1007,38 +1007,58 @@ class CliTests(ApiCase):
 class RescueTests(ApiCase):
 
     @staticmethod
-    def app_image(size=4096, reset=0x08000911, magic=b"GLWA"):
+    def prod_image(size=8192, reset=0x08000911, boot_magic=b"GLWB", app_magic=b"GLWA"):
+        """bootloader page (GLWB id at 0xC0) + app (GLWA manifest at 0x800+0xC0)."""
         img = bytearray(size)
-        img[0:4] = (0x20004000).to_bytes(4, "little")
-        img[4:8] = reset.to_bytes(4, "little")
-        img[0xC0:0xC4] = magic
+        img[0:4] = (0x20003FC0).to_bytes(4, "little")          # boot SP
+        img[4:8] = (0x08000101).to_bytes(4, "little")          # boot reset vector
+        img[0xC0:0xC4] = boot_magic
+        img[0x800:0x804] = (0x20003FC0).to_bytes(4, "little")  # app SP
+        img[0x804:0x808] = reset.to_bytes(4, "little")         # app reset vector
+        img[0x8C0:0x8C4] = app_magic
         return bytes(img)
 
-    def test_check_app_image(self):
+    @staticmethod
+    def app_only_image(size=4096, reset=0x08000911):
+        img = bytearray(size)
+        img[4:8] = reset.to_bytes(4, "little")
+        img[0xC0:0xC4] = b"GLWA"
+        return bytes(img)
+
+    def test_check_rescue_image(self):
         root = self.tmp.name
         good = os.path.join(root, "good.bin")
         with open(good, "wb") as f:
-            f.write(self.app_image())
-        self.assertIsNone(glowbug.check_app_image(good))
+            f.write(self.prod_image())
+        self.assertIsNone(glowbug.check_rescue_image(good))
         cases = [("tiny", b"\x00" * 100, "too small"),
-                 ("nomagic", self.app_image(magic=b"GLWB"), "GLWA"),
-                 ("lowvec", self.app_image(reset=0x08000401), "reset vector"),
-                 ("highvec", self.app_image(reset=0x0800F801), "reset vector"),
-                 ("big", self.app_image(size=61441), "does not fit")]
+                 ("noboot", self.prod_image(boot_magic=b"XXXX"), "GLWB"),
+                 ("noapp", self.prod_image(app_magic=b"XXXX"), "GLWA"),
+                 ("apponly", self.app_only_image(), "app-only"),
+                 ("lowvec", self.prod_image(reset=0x08000401), "reset vector"),
+                 ("highvec", self.prod_image(reset=0x0800F801), "reset vector"),
+                 ("big", self.prod_image(size=63489), "settings page")]
         for name, data, needle in cases:
             p = os.path.join(root, name + ".bin")
             with open(p, "wb") as f:
                 f.write(data)
-            self.assertIn(needle, glowbug.check_app_image(p) or "", name)
-        self.assertIsNone(glowbug.check_app_image(
-            self._write("edge.bin", self.app_image(size=61440, reset=0x0800F7FF))))
-        self.assertIn("unreadable", glowbug.check_app_image(os.path.join(root, "nope")))
-        # the 1.4.x whole-flash image in the repo is refused (page 0 = bootloader)
+            self.assertIn(needle, glowbug.check_rescue_image(p) or "", name)
+        self.assertIsNone(glowbug.check_rescue_image(
+            self._write("edge.bin", self.prod_image(size=63488, reset=0x0800F7FF))))
+        self.assertIn("unreadable", glowbug.check_rescue_image(os.path.join(root, "nope")))
+        # a 1.4.x whole-flash image (no GLWB id) is refused; a 2.0.0 production
+        # image in the repo passes
         old = os.path.join(REPO, "firmware", "glowbug.bin")
         if os.path.exists(old):
-            self.assertIn("GLWA", glowbug.check_app_image(old))
-        self.assertEqual((glowbug.APP_FLASH_ADDR, glowbug.APP_MAGIC_OFFSET, glowbug.APP_MAGIC),
-                         (0x08000800, 0xC0, b"GLWA"))
+            data = open(old, "rb").read()
+            if data[0xC0:0xC4] == b"GLWB":
+                self.assertIsNone(glowbug.check_rescue_image(old))
+            else:
+                self.assertIn("GLWB", glowbug.check_rescue_image(old))
+        self.assertEqual((glowbug.FLASH_ADDR, glowbug.APP_FLASH_ADDR, glowbug.MAGIC_OFFSET,
+                          glowbug.BOOT_MAGIC, glowbug.APP_MAGIC),
+                         (0x08000000, 0x08000800, 0xC0, b"GLWB", b"GLWA"))
+        self.assertIs(glowbug.check_app_image, glowbug.check_rescue_image)
 
     def _write(self, name, data):
         p = os.path.join(self.tmp.name, name)
@@ -1046,7 +1066,7 @@ class RescueTests(ApiCase):
             f.write(data)
         return p
 
-    def test_rescue_refuses_non_app_and_flashes_at_0x08000800(self):
+    def test_rescue_refuses_non_production_and_flashes_at_0x08000000(self):
         calls = []
         patched = {k: getattr(glowbug, k) for k in
                    ("_find_firmware", "_dfu_present", "find_port", "PLIST_PATH")}
@@ -1067,7 +1087,8 @@ class RescueTests(ApiCase):
             glowbug._dfu_present = lambda: True
             glowbug.find_port = lambda: "/dev/cu.usbmodem1"
             glowbug.PLIST_PATH = os.path.join(self.tmp.name, "no.plist")
-            bad = self._write("old.bin", self.app_image(magic=b"\x02\xb4qF"))
+            # a 1.4.x whole-flash image (no GLWB id) and an app-only image are both refused
+            bad = self._write("old.bin", self.prod_image(boot_magic=b"\x02\xb4qF"))
             glowbug._find_firmware = lambda: (bad, "1.4.17")
             out = io.StringIO()
             import contextlib
@@ -1075,13 +1096,20 @@ class RescueTests(ApiCase):
                 with self.assertRaises(SystemExit) as cm:
                     glowbug.rescue()
             self.assertIn("Refusing to flash", str(cm.exception))
-            self.assertIn("GLWA", str(cm.exception))
+            self.assertIn("GLWB", str(cm.exception))
             self.assertEqual(calls, [])                      # dfu-util never ran
-            good = self._write("app.bin", self.app_image())
+            apponly = self._write("app.bin", self.app_only_image())
+            glowbug._find_firmware = lambda: (apponly, "2.0.0")
+            with contextlib.redirect_stdout(out):
+                with self.assertRaises(SystemExit) as cm:
+                    glowbug.rescue()
+            self.assertIn("app-only", str(cm.exception))
+            self.assertEqual(calls, [])
+            good = self._write("prod.bin", self.prod_image())
             glowbug._find_firmware = lambda: (good, "2.0.0")
             with contextlib.redirect_stdout(out):
                 glowbug.rescue()
-            self.assertEqual(calls, [["dfu-util", "-a", "0", "-s", "0x08000800:leave",
+            self.assertEqual(calls, [["dfu-util", "-a", "0", "-s", "0x08000000:leave",
                                       "-D", good]])
             self.assertIn("restored (fw 2.0.0)", out.getvalue())
         finally:
