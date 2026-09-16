@@ -77,8 +77,9 @@ Codex ────────┤
 Antigravity ──┘
 ```
 
-Your tools already announce what they're doing. The daemon listens and sends
-the device one line of text per change. The firmware draws it.
+The AI tools you use already announce what they're doing via hooks. The
+Glowbug daemon listens to these hooks and tells the Glowbug device what to do
+(what lights to light up, which colors, etc).
 
 ## What it can see
 
