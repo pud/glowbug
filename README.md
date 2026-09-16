@@ -2,7 +2,7 @@
 
 ## What is it?
 
-Glowbug is a robot (if you could call it that) that connects to your computer
+Glowbug is a robot (if you can call it that) that connects to your computer
 via USB.
 
 It helps AI coding agents get your attention by beeping, flashing lights,
