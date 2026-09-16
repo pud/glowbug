@@ -2,15 +2,19 @@
 
 ## What is it?
 
-If you run AI coding agents, you know the problem: three or four of them are
-working in different windows, and the one that has stopped to ask you a
-question is the one you aren't looking at.
+Glowbug is a robot that connects to your computer via USB.
 
-Glowbug is a small desk device that fixes that. It plugs into your Mac over
-USB and shows what each agent is doing right now, one agent per screen, with
-a light above each screen that you can read from across the room: thinking,
-waiting for your answer, waiting for permission, just finished. You stop
-cycling through windows; you glance at the bar.
+It helps AI coding agents get your attention by beeping, flashing lights,
+changing color, and writing messages on its 5 OLED screens.
+
+It doesn't have arms and legs yet so it won't run after you.
+
+I don't know how you use coding agents (like Claude Code, Codex or Cursor).
+But when I'm waiting for it to finish something, I might flip over to YouTube
+or organize a desk in my office or whatever -- then come back to my agent to
+find out it's been waiting 24 minutes for me to answer some yes/no question.
+
+Glowbug fixes that. When your agent is done, you'll know.
 
 Physically it is a machined aluminum bar about 25 cm long, with five small
 OLED screens, ten lights (five above the screens, five underneath as an
