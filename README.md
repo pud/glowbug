@@ -12,7 +12,7 @@ writing messages on its 5 OLED screens.
 
 Your computer talks to Glowbug using this open-source software.
 
-## How do I set it up?
+## Installing Glowbug
 
 First you need a Glowbug:
 
