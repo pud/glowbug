@@ -24,8 +24,8 @@ bottom), and one clickable-knob (to access menu/settings).
 
 The code on this page is the part that runs on your computer (think of it
 like a driver). The code is simple, invisible (runs in the background), and
-open-source. Glowbug does not have access to the internet or a mind of its
-own; think of it like another peripheral like your monitor or mouse.
+open-source. Glowbug does not have access to the internet and can't see what
+you're doing; think of it as another peripheral like your monitor or mouse.
 
 ## Who is it for?
 
