@@ -40,9 +40,19 @@ change to "last event Ns ago".
   `~/.glowbug/glowbug-hook.py`, and that the file is executable.
 - `tail -f ~/Library/Logs/glowbug.log` shows every event as it arrives.
 
-**A state I expected never lights up** — some are genuinely unavailable; see
-the support matrix in the README. Cursor has no watch-only approval event
-(no pink light), and Codex has no failure event (no red).
+**A state I expected never lights up** — some are genuinely unavailable.
+What each tool can tell Glowbug:
+
+| | thinking | question | permission | done | error | closed |
+|---|---|---|---|---|---|---|
+| **Claude Code** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **Cursor** | ✓ | — | — | ✓ | ✓ | ✓ |
+| **Codex** | ✓ | — | ✓ | ✓ | — | ✓ |
+| **Antigravity** | ✓ | — | — | ✓ | ✓ | after a while |
+
+The dashes are honest gaps — those tools don't have a safe event for that
+moment. Cursor has no watch-only approval event (no pink light), and Codex
+has no failure event (no red).
 
 ---
 
