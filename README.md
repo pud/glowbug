@@ -11,9 +11,12 @@ changing color, and writing messages on its 5 OLED screens.
 It doesn't have arms and legs yet so it won't run after you.
 
 I built Glowbug for those times when my coding agent is *waiting for me* but
-I didn't notice. Glowbug fixes that.
+I didn't notice.
 
-When your agent is done, you'll know. Saving valuable, frustrating minutes.
+Glowbug fixes that.
+
+When your agent is done, it'll let you know. Either subtly ...or loud and
+annoyingly (you set the rules).
 
 Physically, it's a machined aluminum bar about 25 cm long. Five little OLED
 screens, ten lights (five above the screens, five underneath for a glow) and
