@@ -9,19 +9,29 @@
     glowbug.py doctor       verbose health check (paths, per-tool wiring)
     glowbug.py --version
 
+    glowbug.py show 3 --color green --line1 "Build OK" --sound ding --for 5
+    glowbug.py led / text / sound / raw / own / release / events / info /
+               palette / settings      (--help on any of them; PROTOCOL.md)
+
 Everything Glowbug knows stays on this Mac. There is no network code in this
 file — it reads your coding agents' local hook events (Claude Code's
 session registry, and Cursor chat titles from its local DB), and writes to
-the Glowbug device over USB serial. That's it. Read it and see: it's one
-file, standard library only.
+the Glowbug device over USB serial. Your own programs talk to the daemon
+over its unix socket (or `import glowbug`); the daemon is the only writer
+to the port. That's it. Read it and see: it's one file, standard library
+only.
 
 https://glowbug.dev · https://github.com/pud/glowbug · MIT license
 """
 
+import argparse
+import collections
 import glob
 import json
 import os
+import queue
 import re
+import select
 import shutil
 import socket
 import sqlite3
@@ -30,6 +40,7 @@ import sys
 import termios
 import threading
 import time
+import traceback
 
 VERSION = "1.5.0"
 NUM_SLOTS = 5                        # pre-negotiation window (old boards show 5)
@@ -82,7 +93,8 @@ HOOK_APPEAR_S = 2.0
 
 HOME = os.path.expanduser("~")
 APP_DIR = os.path.join(HOME, ".glowbug")
-SOCK_PATH = os.path.join(HOME, "Library", "Application Support", "Glowbug", "daemon.sock")
+SOCK_PATH = (os.environ.get("GLOWBUG_SOCK")
+             or os.path.join(HOME, "Library", "Application Support", "Glowbug", "daemon.sock"))
 SESS_STATE = os.path.join(HOME, "Library", "Application Support", "Glowbug", "sessions.json")
 LOG_PATH = os.path.join(HOME, "Library", "Logs", "glowbug.log")
 PLIST_PATH = os.path.join(HOME, "Library", "LaunchAgents", "dev.glowbug.daemon.plist")
@@ -92,6 +104,747 @@ SESSIONS_DIR = os.path.join(HOME, ".claude", "sessions")
 CURSOR_STATE_DB = os.path.join(
     HOME, "Library", "Application Support", "Cursor",
     "User", "globalStorage", "state.vscdb")
+
+# ------------------------------------------------------------- the host API
+# The board speaks PROTO 4 (PROTOCOL.md) and that protocol is FROZEN: the
+# shipped units never get a firmware upgrade, so everything a program could
+# want is reachable through raw commands, and NAMES are resolved here on
+# the host into raw values before anything is sent. The board never sees a
+# name it doesn't already know, so these tables can grow forever.
+SOCKET_API = 2          # daemon.sock reply shape: {"ok", "api": 2, ...}
+PROTOCOL_MIN = 4        # oldest board PROTO the API will drive. A PROTO 3
+                        # board still gets the agent display; API calls
+                        # answer proto_too_old -> `glowbug rescue`.
+
+# TONE limits the board enforces (its INFO line reports the same numbers).
+NOTES_MAX = 32          # notes per sequence
+TONE_HZ_MIN = 50        # TIM1's period register is 16-bit: nothing lower
+TONE_HZ_MAX = 20000
+TONE_MS_MAX = 5000      # per note AND for the whole sequence
+
+# Named colors, name -> "RRGGBB" (uppercase). The first two groups are
+# also baked into the firmware (so a bare terminal can type `LED 0 SET
+# red`); the product tints are the board's own state colors at full
+# brightness, read at the MID-POINT of each eased channel from fw 1.4.17
+# state_render — line numbers are pcb/pud76-coderdong/v5/firmware/src/
+# main.cpp in the pudtronics repo. Everything after that is host-only
+# sugar: add your own in ~/.glowbug/palette.json, no firmware involved.
+# Tip for fades/pulses: channels at 0 or high counts scale cleanly; a low
+# count (0x20 at 30 % brightness = 0x0A) steps visibly.
+PALETTE = {
+    "off":        "000000",
+    "white":      "FFFFFF",
+    "red":        "FF0000",
+    "green":      "00FF00",
+    "blue":       "0000FF",
+    "yellow":     "FFFF00",
+    "orange":     "FF8000",
+    "violet":     "8000FF",
+    "cyan":       "00FFFF",
+    "magenta":    "FF00FF",
+    # product tints
+    "thinking":   "5400FF",   # SS_THINKING :781 — R eases 0x18..0x90, B full
+    "question":   "FF3800",   # SS_QUESTION :808 — R full, G eases 0x18..0x58
+    "permission": "FF1C50",   # SS_PERMISSION :795-798 — R full, G 0x08..0x30,
+                              # B pinned 0x50
+    "error":      "C00000",   # SS_ERROR :824-825 — 0xC0 red / off, 500 ms
+                              # blink: a hard blink has no mid-point, this
+                              # is its ON phase
+    "done":       "008800",   # SS_DONE :819 — G eases 0x50..0xC0
+    "unread":     "00C000",   # SS_UNREAD :822-823 — solid
+    "subagent":   "303030",   # subagent_pulse :764 — white 0x10..0x50
+    "lamp":       "FF6412",   # LAMP_WARM_WHITE :714 — R255 G100 B18
+    # host extras
+    "warm":       "FF6412",   # = lamp
+    "pink":       "FF40A0",
+    "ember":      "FF3000",
+    "amber":      "FFA000",
+    "gold":       "FFC800",
+    "lime":       "80FF00",
+    "mint":       "40FFA0",
+    "teal":       "00C0A0",
+    "sky":        "40A0FF",
+    "indigo":     "4000FF",
+    "purple":     "A000FF",
+    "rose":       "FF2080",
+    "coral":      "FF6040",
+    "cool":       "C0E0FF",
+    "grey":       "404040",
+    "gray":       "404040",
+    "dim":        "101010",
+}
+
+# Named sounds, name -> [(hz, ms), ...], hz 0 = rest. The first seven are
+# the board's own chimes, copied note-for-note from fw 1.4.17 main.cpp
+# :173-191 (MELODY_CLICK/DING/SOFT/BLIP/HELLO/BYE/BOOT), so `SOUND ding`
+# on the wire and a TONE of these notes are the same thing. The buzzer is
+# loudest near its 2.7 kHz resonance. Extras are host-only; add your own
+# in ~/.glowbug/sounds.json.
+SOUNDS = {
+    "fanfare": [(1568, 55), (2093, 55), (2637, 55), (3136, 85),   # G6 C7 E7 G7,
+                (0, 30), (3136, 55), (4186, 200)],                 # rest, G7 grace, C8
+    "ding":    [(2637, 70), (0, 20), (3951, 260)],                 # E7 -> B7 doorbell
+    "soft":    [(3136, 90), (2637, 90), (2093, 200)],              # G7 E7 C7 descend
+    "blip":    [(3136, 45)],                                       # G7 confirm
+    "hello":   [(2637, 25), (3520, 40)],                           # E7 -> A7 birth chirp
+    "bye":     [(2637, 70), (2093, 70), (1568, 150)],              # E7 C7 G6 farewell
+    "boot":    [(2093, 50), (2637, 50), (3136, 50), (4186, 150)],  # C7 E7 G7 C8 sparkle
+    # host extras
+    "tick":    [(4000, 12)],
+    "flutter": [(3136, 30), (3520, 30), (3951, 30), (3520, 30), (3136, 30)],
+    "snap":    [(4186, 20), (0, 10), (2093, 30)],
+    "beep":    [(2700, 120)],
+    "double":  [(2700, 80), (0, 60), (2700, 80)],
+    "rise":    [(1568, 60), (2093, 60), (2637, 60), (3136, 120)],
+    "fall":    [(3136, 60), (2637, 60), (2093, 60), (1568, 120)],
+    "warn":    [(2093, 150), (0, 80), (2093, 150)],
+    "fail":    [(1568, 120), (0, 30), (1319, 120), (0, 30), (1047, 240)],  # G6 E6 C6
+    "alarm":   [(3136, 120), (2093, 120)] * 3,
+    "coin":    [(3951, 60), (5274, 300)],                          # B7 -> E8
+    "knock":   [(1047, 30), (0, 80), (1047, 30)],
+    # ... --- ...   dot 100 / dash 300 / gap 100 / letter gap 300 = 3.0 s
+    "sos":     [(2700, 100), (0, 100), (2700, 100), (0, 100), (2700, 100), (0, 300),
+                (2700, 300), (0, 100), (2700, 300), (0, 100), (2700, 300), (0, 300),
+                (2700, 100), (0, 100), (2700, 100), (0, 100), (2700, 100), (0, 300)],
+}
+
+# The user's own tables. Read by load_tables(); NEVER created by Glowbug.
+PALETTE_PATH = os.path.join(APP_DIR, "palette.json")   # {"name": "RRGGBB"}
+SOUNDS_PATH = os.path.join(APP_DIR, "sounds.json")     # {"name": [[hz, ms], ...]
+                                                       #  or "hz:ms,hz:ms"}
+
+NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,23}")   # color/sound names (lowercased)
+_HEX3_RE = re.compile(r"#[0-9a-fA-F]{3}")
+_HEX6_RE = re.compile(r"#?[0-9a-fA-F]{6}")
+
+
+def parse_color(s, colors=None):
+    """'#0f0' / '#00ff00' / '00FF00' / 'green' -> 'RRGGBB' (uppercase).
+    Names are case-insensitive, looked up in `colors` (default: the
+    built-in PALETTE; pass load_tables()[0] for the user-merged one). Hex
+    wins over names, so a name can never be six hex digits."""
+    if not isinstance(s, str):
+        raise ValueError("unknown color %r (glowbug palette lists them)" % (s,))
+    t = s.strip()
+    if _HEX3_RE.fullmatch(t):
+        return "".join(c + c for c in t[1:]).upper()
+    if _HEX6_RE.fullmatch(t):
+        return t.lstrip("#").upper()
+    key = t.lower()
+    table = PALETTE if colors is None else colors
+    if NAME_RE.fullmatch(key) and key in table:
+        return table[key]
+    raise ValueError("unknown color '%s' (glowbug palette lists them)" % s)
+
+
+def check_notes(notes):
+    """Validate [(hz, ms), ...] against the board's TONE limits; returns
+    the list. Errors name the offending note (1-based)."""
+    if not notes:
+        raise ValueError("no notes")
+    if len(notes) > NOTES_MAX:
+        raise ValueError("%d notes (max %d)" % (len(notes), NOTES_MAX))
+    total = 0
+    for i, (hz, ms) in enumerate(notes, 1):
+        if not (hz == 0 or TONE_HZ_MIN <= hz <= TONE_HZ_MAX):
+            raise ValueError("note %d (%d:%d): hz must be 0 or %d..%d"
+                             % (i, hz, ms, TONE_HZ_MIN, TONE_HZ_MAX))
+        if not 1 <= ms <= TONE_MS_MAX:
+            raise ValueError("note %d (%d:%d): ms must be 1..%d"
+                             % (i, hz, ms, TONE_MS_MAX))
+        total += ms
+    if total > TONE_MS_MAX:
+        raise ValueError("total %d ms (max %d)" % (total, TONE_MS_MAX))
+    return notes
+
+
+def _note(i, it):
+    """One (hz, ms) from either grammar; `i` is 1-based for the error."""
+    if isinstance(it, str):
+        hz, sep, ms = it.partition(":")
+        try:
+            if sep:
+                return int(hz.strip()), int(ms.strip())
+        except ValueError:
+            pass
+        raise ValueError("note %d (%r): want hz:ms" % (i, it.strip()))
+    try:
+        hz, ms = it
+    except (TypeError, ValueError):
+        hz = ms = None
+    if isinstance(hz, int) and isinstance(ms, int) \
+            and not isinstance(hz, bool) and not isinstance(ms, bool):
+        return hz, ms
+    raise ValueError("note %d (%r): want [hz, ms] integers" % (i, it))
+
+
+def parse_notes(spec, sounds=None):
+    """A sound name, a 'hz:ms,hz:ms,...' string, or a list of (hz, ms)
+    pairs -> validated [(hz, ms), ...] (a fresh list). Names are case-
+    insensitive, looked up in `sounds` (default: the built-in SOUNDS)."""
+    if isinstance(spec, str):
+        t = spec.strip()
+        if ":" not in t:
+            key = t.lower()
+            table = SOUNDS if sounds is None else sounds
+            if NAME_RE.fullmatch(key) and key in table:
+                return list(table[key])
+            raise ValueError("unknown sound '%s' (glowbug sounds lists them)" % spec)
+        items = t.split(",")
+    else:
+        try:
+            items = list(spec)
+        except TypeError:
+            raise ValueError("notes must be a name, 'hz:ms,...' or a list of pairs")
+    return check_notes([_note(i, it) for i, it in enumerate(items, 1)])
+
+
+def scale_color(color, pct):
+    """Dim a color to pct % (0..100) per channel, rounding half-up the way
+    the board does when it folds brightness in ((c * br + 50) / 100 —
+    state_render :782-784) so host and board agree to the count. Accepts
+    anything parse_color does; returns 'RRGGBB'."""
+    try:
+        pct = int(pct)
+    except (TypeError, ValueError):
+        raise ValueError("brightness must be 0..100, not %r" % (pct,))
+    if not 0 <= pct <= 100:
+        raise ValueError("brightness must be 0..100, not %d" % pct)
+    c = parse_color(color)
+    return "".join("%02X" % ((int(c[i:i + 2], 16) * pct + 50) // 100)
+                   for i in (0, 2, 4))
+
+
+def notes_to_wire(notes):
+    """[(hz, ms), ...] -> 'hz:ms,hz:ms' — the TONE argument, exactly."""
+    return ",".join("%d:%d" % (hz, ms) for hz, ms in notes)
+
+
+def _user_table(path, warnings):
+    """One user JSON table as a dict, or {}. Missing is normal; anything
+    else wrong becomes a warning, never an exception — a typo in
+    palette.json must not take the daemon down."""
+    fname = os.path.basename(path)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        warnings.append("%s: unreadable (%s) — ignored" % (fname, e))
+        return {}
+    if not isinstance(data, dict):
+        warnings.append("%s: expected a JSON object {name: value} — ignored"
+                        % fname)
+        return {}
+    return data
+
+
+def load_tables(palette_path=None, sounds_path=None):
+    """(colors, sounds, warnings): the built-in PALETTE/SOUNDS with the
+    user's ~/.glowbug/palette.json and sounds.json merged on top. User
+    entries win and may name something already defined (built-in, or
+    earlier in the same file). A bad entry is skipped and described in
+    `warnings`; the built-in tables are never mutated and the files are
+    never created."""
+    colors, sounds, warnings = dict(PALETTE), dict(SOUNDS), []
+    ppath = PALETTE_PATH if palette_path is None else palette_path
+    spath = SOUNDS_PATH if sounds_path is None else sounds_path
+    for path, table, parse in ((ppath, colors, parse_color),
+                               (spath, sounds, parse_notes)):
+        fname = os.path.basename(path)
+        for name, val in _user_table(path, warnings).items():
+            key = str(name).lower()
+            if not NAME_RE.fullmatch(key):
+                warnings.append("%s: %r skipped — a name is [a-z][a-z0-9_-]{0,23}"
+                                % (fname, name))
+                continue
+            if table is colors and _HEX6_RE.fullmatch(key):
+                warnings.append("%s: %r skipped — six hex digits always read "
+                                "as a color, never as a name" % (fname, name))
+                continue
+            try:
+                table[key] = parse(val, table)
+            except ValueError as e:
+                warnings.append("%s: %r skipped — %s" % (fname, name, e))
+    return colors, sounds, warnings
+
+
+# A typo in the tables above must fail here, at import, not on somebody's
+# first `glowbug sound` — the daemon is the only writer to the board.
+for _n, _v in SOUNDS.items():
+    check_notes(_v)
+for _n, _v in PALETTE.items():
+    if not (NAME_RE.fullmatch(_n) and len(_v) == 6 and _v == _v.upper()
+            and _HEX6_RE.fullmatch(_v)):
+        raise ValueError("PALETTE[%r] = %r is not RRGGBB" % (_n, _v))
+del _n, _v
+
+# Board geometry the compose functions assume (the board's INFO line
+# confirms it: LEDS 10 GLASS 5 UG 5 SCREENS 5). Host indices are 1-based —
+# screens and status LEDs 1-5 left to right, underglow ug1-ug5 — and the
+# wire is 0-based: screen n -> n-1, ugN -> 4+N.
+NUM_GLASS = 5
+NUM_LEDS = 10
+TEXT_MAX = 21           # chars per OLED text line (the board clips, we warn)
+LINE_MAX = 1023         # wire line length, excluding the terminator
+FOR_MIN_S = 0.05        # `for` bounds in seconds: the board caps FOR at 24 h
+FOR_MAX_S = 86400
+PERIOD_MIN_MS = 16      # FADE / PULSE / BLINK period bounds on the wire
+PERIOD_MAX_MS = 65535
+FADE_MS = 700           # `--mode fade` default
+PULSE_MS = 2000         # `--mode pulse` default period; `to` defaults to 30 %
+PULSE_TO_PCT = 30
+BLINK_MS = 1000         # `--mode blink` default period; `to` defaults to off
+SETTINGS_KEYS = {       # GET/SET keys and their ranges (numeric on the wire)
+    "brightness": (0, 100), "ug_brightness": (0, 100), "ug_mode": (0, 2),
+    "volume": (0, 4), "chime": (0, 2), "flip": (0, 1),
+}
+
+# Daemon-side limits. The socket reply is "validated and queued", never
+# "delivered": raw lines wait in tx_queue until the serial thread pulls
+# them behind the agent-display push (only it ever writes to the port).
+TX_API_LOWWATER = 8 * 1024       # serial thread stops pulling when its
+                                 # unsent tail is this long (board mid-blit)
+TX_API_MAX_BYTES = 512 * 1024    # queue caps -> synchronous `busy`
+TX_API_MAX_ENTRIES = 4096
+TX_REQUEST_MAX = 32 * 1024       # one request's blob (keeps the serial
+                                 # thread's 64 KiB drop-whole cap unreachable)
+RAW_MAX_LINES = 256              # lines per `raw` request
+CONFIRM_TIMEOUT_S = 1.0          # ECHO barrier wait -> `timeout`
+CACHE_GRACE_S = 0.5              # an EVT OWN older than a just-sent OWN
+                                 # must not prune the replay cache
+MAX_CONNS = 64                   # concurrent socket connections -> `busy`
+MAX_SUBSCRIBERS = 16             # concurrent `events` streams -> `busy`
+SUB_QUEUE = 256                  # events buffered per subscriber, then dropped
+SOCK_READ_TIMEOUT_S = 2.0
+SOCK_REQUEST_MAX = 1 << 20       # one request line, bytes
+RAW_FORBIDDEN = ("DFU", "REPLY")  # verbs `raw` will not relay
+
+ERROR_CODES = ("bad_request", "unknown_cmd", "bad_arg", "no_board",
+               "proto_too_old", "busy", "board_err", "timeout", "no_daemon")
+
+
+class GlowbugError(Exception):
+    """An API refusal. `code` is one of ERROR_CODES; `message` is for
+    humans. Raised by the Python helpers when the daemon says ok:false
+    (or can't be reached: code "no_daemon"), and used inside the daemon to
+    turn a refusal into the {"ok": false, "error", "message"} reply."""
+
+    def __init__(self, code, message=""):
+        Exception.__init__(self, message or code)
+        self.code = code
+        self.message = message or code
+
+    def __str__(self):
+        return self.message
+
+
+def _ok(**kw):
+    d = {"ok": True, "api": SOCKET_API}
+    d.update(kw)
+    return d
+
+
+def _fail(code, message, **kw):
+    d = {"ok": False, "api": SOCKET_API, "error": code, "message": message}
+    d.update(kw)
+    return d
+
+
+# ------------------------------------------------- selectors + compose
+# Pure functions: a request dict in, the exact wire lines out. They know
+# nothing about sockets or the serial port, so every line the daemon can
+# send is testable byte-for-byte without hardware. The daemon only adds
+# queueing, the brightness setting, and the replay cache on top.
+
+def _sel_tokens(v):
+    """Selector input -> lowercase tokens: 3 / "3" / "1,3,ug2" / [1, "ug2"]."""
+    if v is None or isinstance(v, bool):
+        raise ValueError("missing selector")
+    if isinstance(v, int):
+        items = [str(v)]
+    elif isinstance(v, str):
+        items = v.split(",")
+    elif isinstance(v, (list, tuple)):
+        items = []
+        for x in v:
+            if isinstance(x, bool) or not isinstance(x, (int, str)):
+                raise ValueError("bad selector %r" % (x,))
+            items.extend(str(x).split(","))
+    else:
+        raise ValueError("bad selector %r" % (v,))
+    toks = [t.strip().lower() for t in items]
+    if not toks or any(not t for t in toks):
+        raise ValueError("bad selector %r" % (v,))
+    return toks
+
+
+def parse_screen_sel(v):
+    """Host screen selector -> wire tokens. Screens are 1-5 left to right
+    -> "0".."4"; "all" -> ["ALL"]; lists "1,3" -> ["0", "2"] (one wire
+    line per screen)."""
+    out = []
+    for t in _sel_tokens(v):
+        if t == "all":
+            tok = "ALL"
+        elif t.isdigit() and 1 <= int(t) <= NUM_GLASS:
+            tok = str(int(t) - 1)
+        else:
+            raise ValueError("bad screen %r: want 1-%d or all" % (t, NUM_GLASS))
+        if tok not in out:
+            out.append(tok)
+    return ["ALL"] if "ALL" in out else out
+
+
+def parse_led_sel(v):
+    """Host LED selector -> wire tokens. Status LEDs 1-5 (under screens
+    1-5) -> "0".."4"; underglow ug1-ug5 -> "5".."9"; the groups all /
+    glass / ug -> ALL / GLASS / UG. Lists give one wire line per LED."""
+    out = []
+    n_ug = NUM_LEDS - NUM_GLASS
+    for t in _sel_tokens(v):
+        if t in ("all", "glass", "ug"):
+            tok = t.upper()
+        elif t.isdigit() and 1 <= int(t) <= NUM_GLASS:
+            tok = str(int(t) - 1)
+        elif t.startswith("ug") and t[2:].isdigit() and 1 <= int(t[2:]) <= n_ug:
+            tok = str(NUM_GLASS + int(t[2:]) - 1)
+        else:
+            raise ValueError("bad led %r: want 1-%d, ug1-ug%d, all, glass or ug"
+                             % (t, NUM_GLASS, n_ug))
+        if tok not in out:
+            out.append(tok)
+    return ["ALL"] if "ALL" in out else out
+
+
+def led_name(i):
+    """Wire LED index -> host name: 0-4 -> "1".."5", 5-9 -> "ug1".."ug5"."""
+    return str(i + 1) if i < NUM_GLASS else "ug%d" % (i - NUM_GLASS + 1)
+
+
+def sel_indices(kind, sel):
+    """Wire selector token ("2", "ALL", "GLASS", "UG", "1,3") -> the set of
+    wire indices it names, for `kind` "led" or "glass". Unknown -> empty."""
+    n = NUM_LEDS if kind == "led" else NUM_GLASS
+    if sel == "ALL":
+        return set(range(n))
+    if kind == "led" and sel == "GLASS":
+        return set(range(NUM_GLASS))
+    if kind == "led" and sel == "UG":
+        return set(range(NUM_GLASS, NUM_LEDS))
+    out = set()
+    for t in sel.split(","):
+        if not (t.isdigit() and int(t) < n):
+            return set()
+        out.add(int(t))
+    return out
+
+
+def parse_for(v):
+    """`for` in seconds -> milliseconds for `FOR <ms>`, or None for an
+    indefinite claim. 0 / None = indefinite; otherwise 0.05..86400 s (the
+    board caps FOR at 24 h)."""
+    if v is None or v is False:
+        return None
+    if isinstance(v, bool):
+        raise ValueError("for: want seconds, not %r" % (v,))
+    try:
+        s = float(v)
+    except (TypeError, ValueError):
+        raise ValueError("for: want seconds, not %r" % (v,))
+    if s == 0:
+        return None
+    if not FOR_MIN_S <= s <= FOR_MAX_S:
+        raise ValueError("for: %g s is outside %g..%g" % (s, FOR_MIN_S, FOR_MAX_S))
+    return int(round(s * 1000))
+
+
+def _int_arg(name, v, lo, hi, default=None):
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        raise ValueError("%s: want an integer, not %r" % (name, v))
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        raise ValueError("%s: want an integer, not %r" % (name, v))
+    if not lo <= n <= hi:
+        raise ValueError("%s: %d is outside %d..%d" % (name, n, lo, hi))
+    return n
+
+
+def sanitize_text(s):
+    """OLED text: one line of printable ASCII (the fonts cover 32..126,
+    anything else -> "?"), whitespace collapsed, "|" (the TEXT line
+    separator) -> "/", clipped to 21. Returns (text, truncated)."""
+    if s is None:
+        return "", False
+    if not isinstance(s, str):
+        s = str(s)
+    t = " ".join(s.split())
+    t = "".join(c if 32 <= ord(c) <= 126 else "?" for c in t).replace("|", "/")
+    return t[:TEXT_MAX], len(t) > TEXT_MAX
+
+
+LED_MODES = ("solid", "fade", "pulse", "blink", "off")
+
+
+def compose_led_lines(tokens, req, colors=None, brightness=100):
+    """LED paint lines for wire selector tokens. mode solid -> SET, fade ->
+    FADE <hex> <fade_ms>, pulse -> PULSE <hex> <to> <period>, blink ->
+    BLINK <hex> <to> <period>, off -> OFF. Colors are scaled by
+    `brightness` (the board's user setting) unless req["raw"]."""
+    mode = req.get("mode")
+    mode = "solid" if mode is None else mode
+    if not isinstance(mode, str) or mode.lower() not in LED_MODES:
+        raise ValueError("mode: want one of %s" % ", ".join(LED_MODES))
+    mode = mode.lower()
+    if mode == "off":
+        return ["LED %s OFF" % t for t in tokens]
+    color = req.get("color")
+    if color is None:
+        raise ValueError("color: required (glowbug palette lists the names)")
+    raw = bool(req.get("raw"))
+
+    def resolve(c):
+        h = parse_color(c, colors)
+        return h if raw else scale_color(h, brightness)
+
+    hexv = resolve(color)
+    if mode == "solid":
+        arg = "SET %s" % hexv
+    elif mode == "fade":
+        ms = req.get("fade_ms")
+        ms = req.get("period") if ms is None else ms
+        arg = "FADE %s %d" % (hexv, _int_arg("fade_ms", ms, PERIOD_MIN_MS,
+                                             PERIOD_MAX_MS, FADE_MS))
+    else:
+        to = req.get("to")
+        if to is not None:
+            to_hex = resolve(to)
+        elif mode == "pulse":
+            to_hex = scale_color(hexv, PULSE_TO_PCT)
+        else:
+            to_hex = "000000"
+        period = _int_arg("period", req.get("period"), PERIOD_MIN_MS, PERIOD_MAX_MS,
+                          PULSE_MS if mode == "pulse" else BLINK_MS)
+        arg = "%s %s %s %d" % (mode.upper(), hexv, to_hex, period)
+    return ["LED %s %s" % (t, arg) for t in tokens]
+
+
+def compose_text_lines(tokens, req):
+    """TEXT / BIG / CLEAR lines for wire screen tokens. `big` alone -> BIG;
+    line1/line2 -> TEXT <l1>[|<l2>]; nothing left after sanitising ->
+    CLEAR. Returns (lines, truncated)."""
+    big, l1, l2 = req.get("big"), req.get("line1"), req.get("line2")
+    if big is not None and (l1 is not None or l2 is not None):
+        raise ValueError("big: cannot be combined with line1/line2")
+    # The verb+screen prefix is formatted FIRST and the user text appended
+    # afterwards: user text may legitimately contain '%' ("42%"), which must
+    # never reach a %-format.
+    if big is not None:
+        text, truncated = sanitize_text(big)
+        verb, tail = ("BIG", text) if text else ("CLEAR", None)
+    else:
+        t1, tr1 = sanitize_text(l1)
+        t2, tr2 = sanitize_text(l2)
+        truncated = tr1 or tr2
+        if not t1 and not t2:
+            verb, tail = "CLEAR", None
+        elif t2:
+            verb, tail = "TEXT", t1 + "|" + t2
+        else:
+            verb, tail = "TEXT", t1
+    lines = []
+    for t in tokens:
+        lines.append(verb + " " + t if tail is None else verb + " " + t + " " + tail)
+    return lines, truncated
+
+
+def compose_sound(req, sounds=None):
+    """`sound` -> (["TONE hz:ms,...[ VOL n]"], {"duration_ms"}). A name is
+    resolved here — the board only ever sees notes. "off"/"hush" -> HUSH."""
+    spec = req.get("sound")
+    if spec is None:
+        raise ValueError("sound: required (a name or hz:ms,...)")
+    if isinstance(spec, str) and spec.strip().lower() in ("off", "hush", "stop"):
+        return ["HUSH"], {"duration_ms": 0}
+    notes = parse_notes(spec, sounds)
+    vol = _int_arg("volume", req.get("volume"), 0, 4)
+    line = "TONE " + notes_to_wire(notes) + ("" if vol is None else " VOL %d" % vol)
+    return [line], {"duration_ms": sum(ms for _, ms in notes)}
+
+
+def compose_show(req, colors=None, sounds=None, brightness=100):
+    """`show` -> (lines, meta). OWN lines first (GLASS only with text, LED
+    only with a color and not no_led), then the LED paint, the text, the
+    sound; `for` seconds -> FOR <ms> on every OWN. The status LED for
+    screen n is LED n; screen "all" claims LED GLASS. meta: for_ms,
+    truncated."""
+    scr = parse_screen_sel(req.get("screen"))
+    has_text = any(req.get(k) is not None for k in ("big", "line1", "line2"))
+    mode = req.get("mode")
+    has_led = (req.get("color") is not None
+               or (isinstance(mode, str) and mode.lower() == "off")) \
+        and not req.get("no_led")
+    has_sound = req.get("sound") is not None
+    if not (has_text or has_led or has_sound):
+        raise ValueError("nothing to show: give a color, text or sound")
+    ms = parse_for(req.get("for"))
+    suffix = " FOR %d" % ms if ms else ""
+    leds = ["GLASS"] if scr == ["ALL"] else scr
+    lines = []
+    if has_text:
+        lines += ["OWN GLASS %s%s" % (t, suffix) for t in scr]
+    if has_led:
+        lines += ["OWN LED %s%s" % (t, suffix) for t in leds]
+        lines += compose_led_lines(leds, req, colors, brightness)
+    truncated = False
+    if has_text:
+        tl, truncated = compose_text_lines(scr, req)
+        lines += tl
+    if has_sound:
+        lines += compose_sound(req, sounds)[0]
+    return lines, {"for_ms": ms, "truncated": truncated}
+
+
+def compose_led(req, colors=None, brightness=100):
+    """`led` -> (["OWN LED i[ FOR ms]", ..., "LED i ..."], {"for_ms"})."""
+    sel = parse_led_sel(req.get("sel"))
+    ms = parse_for(req.get("for"))
+    suffix = " FOR %d" % ms if ms else ""
+    lines = ["OWN LED %s%s" % (t, suffix) for t in sel]
+    lines += compose_led_lines(sel, req, colors, brightness)
+    return lines, {"for_ms": ms}
+
+
+def compose_text(req):
+    """`text` -> (["OWN GLASS g[ FOR ms]", ..., "TEXT g ..."], {"for_ms",
+    "truncated"})."""
+    scr = parse_screen_sel(req.get("screen"))
+    ms = parse_for(req.get("for"))
+    suffix = " FOR %d" % ms if ms else ""
+    lines = ["OWN GLASS %s%s" % (t, suffix) for t in scr]
+    tl, truncated = compose_text_lines(scr, req)
+    return lines + tl, {"for_ms": ms, "truncated": truncated}
+
+
+def parse_resources(v):
+    """["led:1,ug2", "glass:all", "sound", "enc", "all"] -> wire resources
+    ["LED 0", "LED 6", "GLASS ALL", "SOUND", "ENC", "ALL"]. A bare "led" /
+    "glass" means all of that kind."""
+    if isinstance(v, str):
+        v = [v]
+    if not isinstance(v, (list, tuple)) or not v:
+        raise ValueError("resources: want a list like [\"led:1\", \"glass:3\", \"sound\"]")
+    out = []
+    for r in v:
+        if not isinstance(r, str):
+            raise ValueError("bad resource %r" % (r,))
+        kind, sep, sel = r.strip().lower().partition(":")
+        if kind == "all" and not sep:
+            toks = ["ALL"]
+        elif kind in ("sound", "enc") and not sep:
+            toks = [kind.upper()]
+        elif kind == "led":
+            toks = ["LED " + t for t in parse_led_sel(sel or "all")]
+        elif kind == "glass":
+            toks = ["GLASS " + t for t in parse_screen_sel(sel or "all")]
+        else:
+            raise ValueError("bad resource %r: want led:<sel>, glass:<sel>, "
+                             "sound, enc or all" % r)
+        for t in toks:
+            if t not in out:
+                out.append(t)
+    return out
+
+
+def compose_own(req):
+    """`own` -> (["OWN <res>[ FOR ms]", ...], {"for_ms"})."""
+    res = parse_resources(req.get("resources"))
+    ms = parse_for(req.get("for"))
+    suffix = " FOR %d" % ms if ms else ""
+    return ["OWN %s%s" % (r, suffix) for r in res], {"for_ms": ms}
+
+
+def compose_release(req):
+    """`release` -> (["RELEASE <res>", ...], {}); no resources = ALL."""
+    v = req.get("resources")
+    res = ["ALL"] if not v else parse_resources(v)
+    return ["RELEASE %s" % r for r in res], {}
+
+
+def _setting_value(key, v, lo, hi):
+    if isinstance(v, str):
+        t = v.strip().lower()
+        if key == "flip" and t in ("on", "true", "yes"):
+            return 1
+        if key == "flip" and t in ("off", "false", "no"):
+            return 0
+        v = t
+    elif isinstance(v, bool):
+        if key != "flip":
+            raise ValueError("%s: want %d..%d, not %r" % (key, lo, hi, v))
+        return int(v)
+    return _int_arg(key, v, lo, hi)
+
+
+def compose_settings(req):
+    """`settings` -> (lines, {"op", "keys"}). get -> GET per key (all six
+    without a key); set -> SET + a GET read-back; save -> SAVE."""
+    op = req.get("op")
+    if op not in ("get", "set", "save"):
+        raise ValueError("op: want get, set or save")
+    if op == "save":
+        return ["SAVE"], {"op": "save", "keys": []}
+    key = req.get("key")
+    if key is not None:
+        if not isinstance(key, str) or key.strip().lower() not in SETTINGS_KEYS:
+            raise ValueError("key: want one of %s" % ", ".join(SETTINGS_KEYS))
+        keys = [key.strip().lower()]
+    elif op == "get":
+        keys = list(SETTINGS_KEYS)
+    else:
+        raise ValueError("key: required for set")
+    if op == "get":
+        return ["GET %s" % k for k in keys], {"op": "get", "keys": keys}
+    lo, hi = SETTINGS_KEYS[keys[0]]
+    if "value" not in req:
+        raise ValueError("value: required for set")
+    n = _setting_value(keys[0], req.get("value"), lo, hi)
+    return ["SET %s %d" % (keys[0], n), "GET %s" % keys[0]], {"op": "set", "keys": keys}
+
+
+def check_raw_lines(lines):
+    """Validate `raw` lines: non-empty printable ASCII, <= 1023 chars, at
+    most 256 per request, and never DFU or REPLY (the update trigger and
+    the ack mode belong to the daemon). Returns the stripped lines."""
+    if isinstance(lines, str):
+        lines = [lines]
+    if not isinstance(lines, (list, tuple)) or not lines:
+        raise ValueError("lines: want a non-empty list of strings")
+    if len(lines) > RAW_MAX_LINES:
+        raise ValueError("lines: %d (max %d per request)" % (len(lines), RAW_MAX_LINES))
+    out, total = [], 0
+    for i, line in enumerate(lines, 1):
+        if not isinstance(line, str):
+            raise ValueError("line %d: not a string" % i)
+        t = line.strip()
+        if not t:
+            raise ValueError("line %d: empty" % i)
+        if len(t) > LINE_MAX:
+            raise ValueError("line %d: %d chars (max %d)" % (i, len(t), LINE_MAX))
+        if any(not 32 <= ord(c) <= 126 for c in t):
+            raise ValueError("line %d: printable ASCII only" % i)
+        if t.split()[0].upper() in RAW_FORBIDDEN:
+            raise ValueError("line %d: %s is not relayed (use `glowbug rescue` "
+                             "for updates; replies stay off)" % (i, t.split()[0]))
+        out.append(t)
+        total += len(t) + 1
+    if total > TX_REQUEST_MAX:
+        raise ValueError("request too large (%d bytes, max %d)" % (total, TX_REQUEST_MAX))
+    return out
 
 HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PermissionRequest",
                "PostToolUse", "Stop", "StopFailure", "SessionEnd"]
@@ -360,6 +1113,22 @@ def find_port():
     return None
 
 
+def open_serial(port):
+    """Open the Glowbug's CDC port raw and non-blocking. Raw = no line
+    discipline at all (iflag/oflag/lflag cleared: no echo, no CR/LF
+    translation, no signals), 8 data bits, modem lines ignored. Non-
+    blocking because the daemon's serial thread must never stall on a
+    board mid-blit, and `rescue` only fires one line into it. Raises
+    OSError exactly like os.open — callers own the reconnect/give-up
+    policy. Shared by serial_loop and rescue so they can never drift."""
+    fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    attrs = termios.tcgetattr(fd)
+    attrs[0] = attrs[1] = attrs[3] = 0          # raw
+    attrs[2] = termios.CREAD | termios.CLOCAL | termios.CS8
+    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    return fd
+
+
 # ------------------------------------------------------------------- sessions
 class Session:
     def __init__(self, sid, source="claude"):
@@ -526,6 +1295,27 @@ class Daemon:
         self.pending_meta = {}             # (source, sid) -> cwd/title stashed
                                            # from a no_birth event (see
                                            # _hook_generic), used at birth
+        # ---- the host API (socket api 2 / board PROTO 4). All of it lives
+        # under self.lock; nothing below is ever held across socket or
+        # serial I/O.
+        self.board = None                  # {"online", "port", "fw", "proto",
+                                           #  "slots"} once the board said HELLO
+        self.board_info = {}               # EVT INFO pairs, keys lowercased
+        self.owned = {"led": 0, "glass": 0, "sound": 0, "enc": 0}   # EVT OWN
+        self.settings = {}                 # EVT SET key -> int (brightness...)
+        self.port = None                   # serial port path while open
+        self.tx_queue = collections.deque()  # byte blobs, one per request,
+                                           # pulled by the serial thread
+        self.tx_bytes = 0                  # bytes waiting in tx_queue
+        self.subscribers = []              # live `events` streams
+        self.waiters = collections.OrderedDict()   # ECHO token -> waiter
+        self.confirm_lock = threading.Lock()  # one open barrier at a time,
+                                           # so ERR attribution is exact
+        self.cache = {}                    # replay cache (see _cache_lines)
+        self.stop_event = threading.Event()   # socket_loop exit (tests)
+        self.conn_sem = threading.BoundedSemaphore(MAX_CONNS)
+        self._seq = 0                      # ECHO token counter
+        self.colors, self.sounds, self.table_warnings = load_tables()
         self.load_sessions()               # reattach to agents that were live
                                            # when the previous daemon exited
 
@@ -961,28 +1751,553 @@ class Daemon:
                 "last_event_at": {k: round(now - v, 1)
                                   for k, v in self.last_event_at.items()}}
 
+    # ---- board -> host lines: a dispatcher (PROTO 4) ----
+    # Only EVT HELLO touches the agent display (the slot window). Every
+    # other line becomes an event for `glowbug events` subscribers and
+    # updates the daemon's picture of the board (INFO, OWN, SET), resolves
+    # an ECHO barrier, or is passed through untouched — a board newer than
+    # this daemon is never an error.
+    _EVT_HANDLERS = {"HELLO": "_evt_hello", "INFO": "_evt_info", "ENC": "_evt_enc",
+                     "CLICK": "_evt_click", "HOLD": "_evt_hold", "MENU": "_evt_menu",
+                     "OWN": "_evt_own", "SET": "_evt_set", "ECHO": "_evt_echo"}
+
     def handle_board_line(self, line):
-        parts = line.strip().split()
-        if parts[:2] == ["EVT", "HELLO"]:
-            log("board: hello %s" % " ".join(parts[2:]))
-            # Protocol v3 negotiation: "EVT HELLO <fw> PROTO 3 SLOTS 32".
-            # PROTO<3 (or unparseable) keeps the safe 5-slot window — an old
-            # board drops SLOT n>5 silently, which would otherwise leave it
-            # showing the five OLDEST agents.
+        text = line.strip()
+        parts = text.split()
+        if not parts:
+            return
+        if parts[0] == "EVT":
+            kind = parts[1] if len(parts) > 1 else ""
+            handler = self._EVT_HANDLERS.get(kind)
+            if handler is None:
+                self.emit({"event": "evt", "raw": text})
+            else:
+                getattr(self, handler)(parts[2:], text)
+        elif parts[0] == "ERR":
+            self._on_err(parts, text)
+        elif parts[0] == "OK":
+            return                       # REPLY is never turned on
+        elif os.environ.get("GLOWBUG_DEBUG"):
+            log("board: %s" % text)
+
+    def _evt_hello(self, args, text):
+        parts = ["EVT", "HELLO"] + args
+        log("board: hello %s" % " ".join(args))
+        # Protocol v3 negotiation: "EVT HELLO <fw> PROTO 3 SLOTS 32".
+        # PROTO<3 (or unparseable) keeps the safe 5-slot window — an old
+        # board drops SLOT n>5 silently, which would otherwise leave it
+        # showing the five OLDEST agents.
+        slots = NUM_SLOTS
+        try:
+            if "PROTO" in parts and int(parts[parts.index("PROTO") + 1]) >= 3 \
+                    and "SLOTS" in parts:
+                n = int(parts[parts.index("SLOTS") + 1])
+                slots = max(NUM_SLOTS, min(BOARD_SLOTS_MAX, n))
+        except (ValueError, IndexError):
             slots = NUM_SLOTS
-            try:
-                if "PROTO" in parts and int(parts[parts.index("PROTO") + 1]) >= 3 \
-                        and "SLOTS" in parts:
-                    n = int(parts[parts.index("SLOTS") + 1])
-                    slots = max(NUM_SLOTS, min(BOARD_SLOTS_MAX, n))
-            except (ValueError, IndexError):
-                slots = NUM_SLOTS
+        proto = 0
+        try:
+            if "PROTO" in parts:
+                proto = int(parts[parts.index("PROTO") + 1])
+        except (ValueError, IndexError):
+            proto = 0
+        fw = args[0] if args and args[0] not in ("PROTO", "SLOTS") else "?"
+        with self.lock:
+            if slots != self.board_slots:
+                log("board: slot window %d -> %d" % (self.board_slots, slots))
+                self.board_slots = slots
+            self.assign_slots()
+            self.board = {"online": True, "port": self.port, "fw": fw,
+                          "proto": proto, "slots": slots}
+            # HELLO is the board's session reset (RELEASE ALL + REPLY OFF)
+            self.owned = {"led": 0, "glass": 0, "sound": 0, "enc": 0}
+            if proto >= PROTOCOL_MIN:
+                # capabilities + the brightness `show` scales colors by
+                try:
+                    self._enqueue(b"INFO\nGET brightness\n")
+                except GlowbugError as e:
+                    log("board: INFO not queued: %s" % e)
+        self.dirty = True
+        self.emit({"event": "hello", "fw": fw, "proto": proto, "slots": slots})
+        self.emit({"event": "board", "online": True, "fw": fw, "proto": proto})
+        if proto >= PROTOCOL_MIN:
+            self._replay("hello")        # the board forgot everything
+
+    def _evt_info(self, args, text):
+        info = {}
+        for i in range(0, len(args) - 1, 2):
+            v = args[i + 1]
+            info[args[i].lower()] = int(v) if re.fullmatch(r"-?\d+", v) else v
+        with self.lock:
+            self.board_info = info
+            known = self.board is not None
+        if known:
+            log("board: %s" % text)
+        self.emit({"event": "info", "info": info})
+
+    def _evt_enc(self, args, text):
+        try:
+            delta = int(args[0])
+        except (IndexError, ValueError):
+            self.emit({"event": "evt", "raw": text})
+            return
+        self.emit({"event": "enc", "delta": delta})
+
+    def _evt_click(self, args, text):
+        self.emit({"event": "click"})
+
+    def _evt_hold(self, args, text):
+        self.emit({"event": "hold"})
+
+    def _evt_menu(self, args, text):
+        opened = bool(args) and args[0] == "1"
+        self.emit({"event": "menu", "open": opened})
+        if not opened:
+            # the menu borrowed every glass; owned LED animators come back
+            # by themselves, owned glasses are ours to repaint — and the
+            # user may just have changed the brightness setting
             with self.lock:
-                if slots != self.board_slots:
-                    log("board: slot window %d -> %d" % (self.board_slots, slots))
-                    self.board_slots = slots
-                self.assign_slots()
-            self.dirty = True
+                try:
+                    self._enqueue(b"GET brightness\n")
+                except GlowbugError:
+                    pass
+            self._replay("menu")
+
+    def _evt_own(self, args, text):
+        owned = {}
+        for i in range(0, len(args) - 1, 2):
+            k, v = args[i].lower(), args[i + 1]
+            try:
+                owned[k] = int(v, 16) if k in ("led", "glass") else int(v)
+            except ValueError:
+                self.emit({"event": "evt", "raw": text})
+                return
+        now = time.time()
+        with self.lock:
+            for k in self.owned:
+                if k in owned:
+                    self.owned[k] = owned[k]
+            self._cache_prune(now)
+        self.emit(dict(self._owned_view(), event="own"))
+
+    def _evt_set(self, args, text):
+        if len(args) < 2:
+            self.emit({"event": "evt", "raw": text})
+            return
+        key, v = args[0].lower(), args[1]
+        val = int(v) if re.fullmatch(r"-?\d+", v) else v
+        with self.lock:
+            self.settings[key] = val
+        self.emit({"event": "set", "key": key, "value": val})
+
+    def _evt_echo(self, args, text):
+        with self.lock:
+            w = self.waiters.get(args[0]) if args else None
+            if w is not None:
+                w["event"].set()
+        if w is None:                        # not ours: somebody's raw ECHO
+            self.emit({"event": "evt", "raw": text})
+
+    def _on_err(self, parts, text):
+        with self.lock:
+            known = self.board is not None
+            for w in self.waiters.values():   # the oldest open barrier owns it
+                w["errs"].append(text)
+                break
+        if known:
+            log("board: %s" % text)
+        self.emit({"event": "err", "verb": parts[1] if len(parts) > 1 else "",
+                   "text": text})
+
+    def _board_gone(self):
+        """close_fd: the port is gone. Forget the board (API -> no_board
+        until the next HELLO), drop queued API traffic (a reopened port
+        re-negotiates first), fail any open barrier."""
+        with self.lock:
+            was = self.board is not None
+            self.board = None
+            self.port = None
+            self.board_info = {}
+            self.owned = {"led": 0, "glass": 0, "sound": 0, "enc": 0}
+            self.tx_queue.clear()
+            self.tx_bytes = 0
+            for w in self.waiters.values():
+                w["gone"] = True
+                w["event"].set()
+        if was:
+            self.emit({"event": "board", "online": False})
+
+    # ---- events: fan-out to `glowbug events` streams ----
+    def subscribe(self, kinds=None):
+        """A new subscriber (its queue is drained by a socket thread), or
+        None when MAX_SUBSCRIBERS streams are already open."""
+        sub = _Subscriber(kinds)
+        with self.lock:
+            if len(self.subscribers) >= MAX_SUBSCRIBERS:
+                return None
+            self.subscribers.append(sub)
+        return sub
+
+    def unsubscribe(self, sub):
+        with self.lock:
+            if sub in self.subscribers:
+                self.subscribers.remove(sub)
+
+    def emit(self, ev):
+        """Fan one event dict out. A reader that lets SUB_QUEUE events pile
+        up is dropped (its stream ends with a `busy` line) — the serial
+        thread must never wait on a socket."""
+        with self.lock:
+            subs = list(self.subscribers)
+        for sub in subs:
+            if sub.kinds is not None and ev.get("event") not in sub.kinds:
+                continue
+            try:
+                sub.q.put_nowait(ev)
+            except queue.Full:
+                sub.dropped = True
+                self.unsubscribe(sub)
+
+    # ---- host -> board: the TX hand-off ----
+    # Connection threads never touch the port. They append byte blobs to
+    # tx_queue (under self.lock); the serial thread pulls them behind its
+    # own agent-display push while its unsent tail is short, and tx_drain
+    # is the one place os.write happens.
+    def _enqueue(self, blob):
+        """Caller holds self.lock. Raises busy at the queue caps."""
+        if len(self.tx_queue) >= TX_API_MAX_ENTRIES \
+                or self.tx_bytes + len(blob) > TX_API_MAX_BYTES:
+            raise GlowbugError("busy", "the board is not keeping up (%d bytes "
+                               "queued) — try again in a moment" % self.tx_bytes)
+        self.tx_queue.append(blob)
+        self.tx_bytes += len(blob)
+
+    def _tx_take(self, txlen):
+        """Serial thread: queued blobs to append to its TX buffer, whole
+        blobs only, while the buffer is under TX_API_LOWWATER."""
+        out = []
+        with self.lock:
+            while self.tx_queue and txlen < TX_API_LOWWATER:
+                blob = self.tx_queue.popleft()
+                self.tx_bytes -= len(blob)
+                out.append(blob)
+                txlen += len(blob)
+        return b"".join(out)
+
+    def _send_lines(self, lines):
+        """Queue wire lines as one contiguous blob (a `show` burst never
+        interleaves with another client's) and remember them for replay.
+        Raises busy / no_board."""
+        blob = ("\n".join(lines) + "\n").encode()
+        now = time.time()
+        with self.lock:
+            if self.board is None:
+                raise GlowbugError("no_board", "the board went away")
+            self._enqueue(blob)
+            self._cache_lines(lines, now)
+
+    def _barrier(self, lines, timeout=CONFIRM_TIMEOUT_S):
+        """Queue `lines` + `ECHO <token>` and wait for the board to echo the
+        token: everything before it has then been parsed. Returns the ERR
+        lines the board emitted meanwhile (attributed to this barrier —
+        confirm_lock keeps one open at a time). Raises busy / no_board /
+        timeout."""
+        with self.confirm_lock:
+            self._seq += 1
+            token = "h%x" % self._seq
+            w = {"event": threading.Event(), "errs": [], "gone": False}
+            now = time.time()
+            with self.lock:
+                if self.board is None:
+                    raise GlowbugError("no_board", "the board went away")
+                self._enqueue(("\n".join(lines + ["ECHO " + token]) + "\n").encode())
+                self._cache_lines(lines, now)
+                self.waiters[token] = w
+            done = w["event"].wait(timeout)
+            with self.lock:
+                self.waiters.pop(token, None)
+            if w["gone"]:
+                raise GlowbugError("no_board", "the board went away")
+            if not done:
+                raise GlowbugError("timeout", "no ECHO from the board within %.1f s"
+                                   % timeout)
+            return w["errs"]
+
+    # ---- replay cache ----
+    # The board has no framebuffer and forgets everything on re-enumeration
+    # (its own EVT HELLO) and repaints every glass after its device menu
+    # (EVT MENU 0). So the daemon keeps, per LED / glass selector, the last
+    # OWN line (with its deadline) and the last paint lines it relayed, and
+    # re-sends them: OWN + LED + text after a HELLO, glass content after the
+    # menu. Entries die at their FOR deadline, on RELEASE, and when an EVT
+    # OWN shows the board no longer owns them.
+    def _cache_entry(self, key, now):
+        e = self.cache.get(key)
+        if e is None:
+            e = self.cache[key] = {"own": None, "deadline": None, "content": [],
+                                   "at": now}
+        return e
+
+    def _cache_lines(self, lines, now):
+        """Caller holds self.lock. Parses relayed lines just enough to key
+        them: OWN / RELEASE / LED / TEXT / BIG / CLEAR / BLIT."""
+        for line in lines:
+            p = line.split()
+            if len(p) < 2:
+                continue
+            verb = p[0]
+            if verb == "OWN":
+                ms = None
+                if len(p) >= 4 and p[-2] == "FOR" and p[-1].isdigit():
+                    ms = int(p[-1])
+                if p[1] in ("LED", "GLASS") and len(p) >= 3:
+                    keys = [(p[1].lower(), p[2])]
+                elif p[1] == "ALL":
+                    keys = [("led", "ALL"), ("glass", "ALL")]
+                else:
+                    continue
+                for key in keys:
+                    e = self._cache_entry(key, now)
+                    e["own"] = "OWN %s %s" % (key[0].upper(), key[1])
+                    e["deadline"] = now + ms / 1000.0 if ms else None
+                    e["at"] = now
+            elif verb == "RELEASE":
+                if p[1] == "ALL":
+                    self.cache.clear()
+                elif p[1] in ("LED", "GLASS") and len(p) >= 3:
+                    self._cache_drop(p[1].lower(), p[2])
+            elif verb == "LED" and len(p) >= 3:
+                e = self._cache_entry(("led", p[1]), now)
+                e["content"] = [line]
+                e["at"] = now
+            elif verb in ("TEXT", "BIG", "CLEAR"):
+                e = self._cache_entry(("glass", p[1]), now)
+                e["content"] = [line]
+                e["at"] = now
+            elif verb == "BLIT" and len(p) >= 4:
+                e = self._cache_entry(("glass", p[1]), now)
+                if p[2] == "ALL":
+                    e["content"] = [line]
+                else:
+                    e["content"] = [c for c in e["content"]
+                                    if not (c.startswith("BLIT ")
+                                            and c.split()[2] == p[2])] + [line]
+                e["at"] = now
+
+    def _cache_drop(self, kind, sel):
+        """Caller holds self.lock. Drop every entry of `kind` that shares an
+        index with `sel` (releasing LED 2 also voids an `ALL` entry)."""
+        idx = sel_indices(kind, sel)
+        if not idx:
+            return                       # unparsable: the board releases nothing
+        for key in list(self.cache):
+            if key[0] == kind and sel_indices(*key) & idx:
+                del self.cache[key]
+
+    def _cache_prune(self, now):
+        """Caller holds self.lock, after an EVT OWN: drop expired entries
+        and entries the board no longer owns — except ones asserted within
+        CACHE_GRACE_S, whose EVT OWN is still in flight."""
+        for key, e in list(self.cache.items()):
+            if e["deadline"] is not None and e["deadline"] <= now:
+                del self.cache[key]
+            elif now - e["at"] >= CACHE_GRACE_S:
+                idx = sel_indices(*key)
+                mask = self.owned.get(key[0], 0)
+                if not idx or any(not (mask >> i) & 1 for i in idx):
+                    del self.cache[key]
+
+    def _replay(self, reason):
+        """Re-send cached state: after "hello" every unexpired OWN (with the
+        remaining FOR), LED and glass line; after "menu" glass content only.
+        Then a synthetic `redraw` event so animating apps resend their
+        frame. Returns the lines queued."""
+        now = time.time()
+        owns, content = [], []
+        with self.lock:
+            for key, e in list(self.cache.items()):
+                if e["deadline"] is not None and e["deadline"] <= now:
+                    del self.cache[key]
+                    continue
+                if reason == "hello":
+                    if e["own"]:
+                        line = e["own"]
+                        if e["deadline"] is not None:
+                            line += " FOR %d" % max(1, int(round((e["deadline"] - now) * 1000)))
+                        owns.append(line)
+                        e["at"] = now
+                    content += e["content"]
+                elif key[0] == "glass":
+                    content += e["content"]
+            lines = owns + content
+            if lines:
+                try:
+                    self._enqueue(("\n".join(lines) + "\n").encode())
+                except GlowbugError as err:
+                    log("replay (%s) skipped: %s" % (reason, err))
+                    lines = []
+        self.emit({"event": "redraw", "reason": reason, "lines": len(lines)})
+        return lines
+
+    # ---- the socket API: one request dict -> one reply dict ----
+    COMMANDS = ("report", "info", "show", "led", "text", "sound", "raw", "own",
+                "release", "settings", "palette", "events")
+
+    def handle_request(self, msg):
+        """Never raises. `events` is the one streaming command and is
+        served by the connection thread instead (it needs the socket)."""
+        if not isinstance(msg, dict):
+            return _fail("bad_request", "want a JSON object")
+        api = msg.get("api", SOCKET_API)
+        if isinstance(api, bool) or not isinstance(api, int) or not 1 <= api <= SOCKET_API:
+            return _fail("bad_request", "api %r: this daemon speaks api %d"
+                         % (api, SOCKET_API))
+        cmd = msg.get("cmd")
+        if not isinstance(cmd, str) or cmd not in self.COMMANDS:
+            return _fail("unknown_cmd", "unknown cmd %r (glowbug --help lists them)" % (cmd,))
+        if cmd == "events":
+            return _fail("bad_request", "events streams: keep the socket open")
+        try:
+            return getattr(self, "cmd_" + cmd)(msg)
+        except GlowbugError as e:
+            return _fail(e.code, e.message)
+        except ValueError as e:
+            return _fail("bad_arg", str(e))
+        except Exception as e:                # a bug must not kill the daemon
+            log("api: %s crashed: %s: %s\n%s" % (cmd, type(e).__name__, e,
+                                                  traceback.format_exc()))
+            return _fail("bad_request", "internal error in %s: %s" % (cmd, e))
+
+    def _require_board(self, min_proto=PROTOCOL_MIN):
+        with self.lock:
+            b = self.board
+        if b is None:
+            raise GlowbugError("no_board", "no Glowbug connected — is it plugged in? "
+                               "(glowbug status)")
+        if b["proto"] < min_proto:
+            raise GlowbugError("proto_too_old",
+                               "board firmware %s speaks PROTO %d; the API needs "
+                               "PROTO %d — run `glowbug rescue` to flash the "
+                               "bundled image" % (b["fw"], b["proto"], min_proto))
+        return b
+
+    def _board_view(self):
+        with self.lock:
+            if self.board is None:
+                return {"online": False}
+            v = dict(self.board_info)
+            v.update(self.board)
+            return v
+
+    def _owned_view(self):
+        with self.lock:
+            o = dict(self.owned)
+        return {"led": [led_name(i) for i in range(NUM_LEDS) if (o["led"] >> i) & 1],
+                "glass": [i + 1 for i in range(NUM_GLASS) if (o["glass"] >> i) & 1],
+                "sound": bool(o["sound"]), "enc": bool(o["enc"])}
+
+    def _brightness(self):
+        with self.lock:
+            b = self.settings.get("brightness", 100)
+        return b if isinstance(b, int) and 0 <= b <= 100 else 100
+
+    def _held(self, meta):
+        ms = meta.get("for_ms")
+        return time.time() + ms / 1000.0 if ms else None
+
+    def reload_tables(self):
+        colors, sounds, warnings = load_tables()
+        with self.lock:
+            self.colors, self.sounds, self.table_warnings = colors, sounds, warnings
+        return warnings
+
+    def cmd_report(self, msg):
+        r = self.report()                    # the 1.5.0 keys, untouched
+        r.update(_ok(board=self._board_view()))
+        return r
+
+    def cmd_info(self, msg):
+        with self.lock:
+            b = self.board
+        if msg.get("fresh") and b is not None and b["proto"] >= PROTOCOL_MIN:
+            self._barrier(["INFO"])
+        with self.lock:
+            settings = dict(self.settings)
+            counts = {"colors": len(self.colors), "sounds": len(self.sounds)}
+        return _ok(daemon=VERSION, socket=SOCK_PATH, board=self._board_view(),
+                   owned=self._owned_view(), settings=settings, palette=counts)
+
+    def cmd_show(self, msg):
+        self._require_board()
+        lines, meta = compose_show(msg, self.colors, self.sounds, self._brightness())
+        self._send_lines(lines)
+        return _ok(lines=lines, held_until=self._held(meta), truncated=meta["truncated"])
+
+    def cmd_led(self, msg):
+        self._require_board()
+        lines, meta = compose_led(msg, self.colors, self._brightness())
+        self._send_lines(lines)
+        return _ok(lines=lines, held_until=self._held(meta))
+
+    def cmd_text(self, msg):
+        self._require_board()
+        lines, meta = compose_text(msg)
+        self._send_lines(lines)
+        return _ok(lines=lines, held_until=self._held(meta), truncated=meta["truncated"])
+
+    def cmd_sound(self, msg):
+        self._require_board()
+        lines, meta = compose_sound(msg, self.sounds)
+        self._send_lines(lines)
+        return _ok(lines=lines, duration_ms=meta["duration_ms"])
+
+    def cmd_own(self, msg):
+        self._require_board()
+        lines, meta = compose_own(msg)
+        self._send_lines(lines)
+        return _ok(lines=lines, held_until=self._held(meta))
+
+    def cmd_release(self, msg):
+        self._require_board()
+        lines, _ = compose_release(msg)
+        self._send_lines(lines)
+        return _ok(lines=lines)
+
+    def cmd_raw(self, msg):
+        self._require_board()
+        lines = check_raw_lines(msg["lines"] if "lines" in msg else msg.get("line"))
+        if msg.get("confirm"):
+            errs = self._barrier(lines)
+            if errs:
+                return _fail("board_err", "; ".join(errs), lines=lines, errors=errs)
+            return _ok(lines=lines, queued=len(lines), confirmed=True)
+        self._send_lines(lines)
+        return _ok(lines=lines, queued=len(lines))
+
+    def cmd_settings(self, msg):
+        self._require_board()
+        lines, meta = compose_settings(msg)
+        errs = self._barrier(lines)
+        if errs:
+            return _fail("board_err", "; ".join(errs), errors=errs)
+        if meta["op"] == "save":
+            return _ok(saved=True)
+        with self.lock:
+            vals = {k: self.settings[k] for k in meta["keys"] if k in self.settings}
+        missing = [k for k in meta["keys"] if k not in vals]
+        if missing:
+            return _fail("board_err", "the board sent no EVT SET for %s" % ", ".join(missing))
+        return _ok(settings=vals)
+
+    def cmd_palette(self, msg):
+        if msg.get("reload"):
+            self.reload_tables()
+        with self.lock:
+            colors, sounds, warnings = dict(self.colors), self.sounds, list(self.table_warnings)
+        return _ok(colors=colors,
+                   sounds={k: [[hz, ms] for hz, ms in v] for k, v in sounds.items()},
+                   files={"palette": PALETTE_PATH, "sounds": SOUNDS_PATH},
+                   warnings=warnings)
 
     def serial_loop(self):
         # macOS sleep/wake gotcha (found 2026-08-16): after a lid-close the
@@ -1040,6 +2355,7 @@ class Daemon:
                     log("serial: window back to %d until next HELLO" % NUM_SLOTS)
                     self.board_slots = NUM_SLOTS
                     self.assign_slots()
+            self._board_gone()          # API: no_board, queue dropped, event
 
         def tx_drain():
             # Drain as much of txbuf as the pipe accepts; never block. A
@@ -1097,11 +2413,8 @@ class Daemon:
                         last_poll = time.time()
                     continue
                 try:
-                    fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-                    attrs = termios.tcgetattr(fd)
-                    attrs[0] = attrs[1] = attrs[3] = 0          # raw
-                    attrs[2] = termios.CREAD | termios.CLOCAL | termios.CS8
-                    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+                    fd = open_serial(port)
+                    self.port = port
                     log("serial: opened %s" % port)
                     # Solicit the board's capabilities: its own EVT HELLO
                     # fires only at USB enumeration, which a (re)started
@@ -1134,6 +2447,9 @@ class Daemon:
                         prev_idle = idle
                 if self.dirty:
                     txbuf += self.push_state()
+                # API traffic rides behind the display push, whole blobs,
+                # only while the unsent tail is short (board mid-blit)
+                txbuf += self._tx_take(len(txbuf))
                 if len(txbuf) > 65536:
                     # pipe dead-but-undetected: drop the backlog whole (never
                     # mid-line) and re-push once it drains again
@@ -1155,7 +2471,12 @@ class Daemon:
                 log("serial: lost connection, rescanning")
                 close_fd()
 
-    # ---- hook socket ----
+    # ---- the unix socket: hooks in, API requests in, replies/events out ----
+    # Framing: a client sends ONE JSON object ended by "\n" or by closing
+    # its write side (the hook forwarder and 1.5.0 `ask_daemon` do the
+    # latter); the reply is one JSON line, then the connection closes —
+    # except `events`, which keeps streaming one JSON line per event. A
+    # hook payload is recognised by the ABSENCE of "cmd".
     def socket_loop(self):
         os.makedirs(os.path.dirname(SOCK_PATH), exist_ok=True)
         try:
@@ -1165,32 +2486,132 @@ class Daemon:
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.bind(SOCK_PATH)
         os.chmod(SOCK_PATH, 0o600)
-        srv.listen(16)
-        log("glowbug %s listening on %s" % (VERSION, SOCK_PATH))
+        srv.listen(MAX_CONNS)
+        srv.settimeout(0.5)                  # lets stop_event be noticed
+        self.srv = srv
+        log("glowbug %s listening on %s (api %d)" % (VERSION, SOCK_PATH, SOCKET_API))
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except socket.timeout:
+                    continue
+                except OSError as e:
+                    log("socket: accept failed: %s" % e)
+                    time.sleep(0.1)
+                    continue
+                if not self.conn_sem.acquire(blocking=False):
+                    try:
+                        conn.sendall((json.dumps(_fail(
+                            "busy", "%d connections open — try again" % MAX_CONNS))
+                            + "\n").encode())
+                    except OSError:
+                        pass
+                    conn.close()
+                    continue
+                try:
+                    threading.Thread(target=self.serve_conn, args=(conn,),
+                                     daemon=True).start()
+                except RuntimeError as e:    # can't start a thread
+                    log("socket: %s" % e)
+                    self.conn_sem.release()
+                    conn.close()
+        finally:
+            srv.close()
+
+    @staticmethod
+    def _read_request(conn):
+        """Bytes up to the first newline, or everything up to EOF."""
+        data = b""
         while True:
-            conn, _ = srv.accept()
+            chunk = conn.recv(65536)
+            if not chunk:
+                return data.strip()
+            data += chunk
+            head = data.lstrip()
+            if b"\n" in head:
+                return head.split(b"\n", 1)[0].strip()
+            if len(data) > SOCK_REQUEST_MAX:
+                raise ValueError("request too large")
+
+    def serve_conn(self, conn):
+        """One connection, on its own thread. Every socket error ends this
+        connection only — a client that hangs up before reading its reply
+        (BrokenPipe on sendall) used to take the whole daemon down."""
+        try:
+            conn.settimeout(SOCK_READ_TIMEOUT_S)
+            data = self._read_request(conn)
+            if not data:
+                return
+            msg = json.loads(data.decode(errors="replace"))
+            if isinstance(msg, dict) and "cmd" in msg:
+                if msg.get("cmd") == "events":
+                    self._serve_events(conn, msg)
+                else:
+                    conn.sendall((json.dumps(self.handle_request(msg)) + "\n").encode())
+            elif isinstance(msg, dict):
+                self.handle_hook(msg)
+            else:
+                log("bad hook payload: not a JSON object")
+        except ValueError as e:               # JSONDecodeError is a ValueError
+            log("bad hook payload: %s" % e)
+        except OSError as e:                  # incl. socket.timeout, EPIPE
+            log("socket: client dropped (%s)" % e)
+        finally:
             try:
-                conn.settimeout(2)
-                data = b""
-                while True:
-                    chunk = conn.recv(65536)
-                    if not chunk:
-                        break
-                    data += chunk
-                if data:
-                    msg = json.loads(data.decode(errors="replace"))
-                    if isinstance(msg, dict) and "cmd" in msg:
-                        conn.sendall(json.dumps(self.report()).encode())
-                    else:
-                        self.handle_hook(msg)
-            except (json.JSONDecodeError, socket.timeout, ValueError) as e:
-                log("bad hook payload: %s" % e)
-            finally:
                 conn.close()
+            except OSError:
+                pass
+            self.conn_sem.release()
+
+    def _serve_events(self, conn, msg):
+        kinds = msg.get("filter")
+        if isinstance(kinds, str):
+            kinds = [k for k in kinds.split(",") if k]
+        if kinds is not None and not (isinstance(kinds, list)
+                                      and all(isinstance(k, str) for k in kinds)):
+            conn.sendall((json.dumps(_fail("bad_arg", "filter: want a list of event "
+                                                      "kinds")) + "\n").encode())
+            return
+        sub = self.subscribe(set(kinds) if kinds is not None else None)
+        if sub is None:
+            conn.sendall((json.dumps(_fail("busy", "%d event streams already open"
+                                           % MAX_SUBSCRIBERS)) + "\n").encode())
+            return
+        try:
+            conn.sendall((json.dumps(_ok(cmd="events", board=self._board_view()))
+                          + "\n").encode())
+            while True:
+                try:
+                    ev = sub.q.get(timeout=0.5)
+                except queue.Empty:
+                    ev = None
+                if sub.dropped:
+                    conn.sendall((json.dumps(_fail("busy", "events dropped: reader "
+                                                           "too slow")) + "\n").encode())
+                    return
+                if ev is not None:
+                    conn.sendall((json.dumps(ev) + "\n").encode())
+                r, _, _ = select.select([conn], [], [], 0)
+                if r and not conn.recv(4096):
+                    return                   # the client hung up
+        finally:
+            self.unsubscribe(sub)
+
+
+class _Subscriber:
+    __slots__ = ("q", "kinds", "dropped")
+
+    def __init__(self, kinds):
+        self.q = queue.Queue(SUB_QUEUE)
+        self.kinds = kinds
+        self.dropped = False
 
 
 def run_daemon():
     d = Daemon()
+    for w in d.table_warnings:
+        log("palette: %s" % w)
     t = threading.Thread(target=d.serial_loop, daemon=True)
     t.start()
     d.socket_loop()
@@ -1637,10 +3058,18 @@ def ask_daemon(timeout=1.0):
 def status():
     daemon_ok = launchctl("list", "dev.glowbug.daemon").returncode == 0
     port = find_port()
+    board = port or "not found"
+    try:                                     # the daemon knows fw + PROTO
+        b = _call({"cmd": "info"}, timeout=1.0).get("board") or {}
+        if b.get("online"):
+            board = "%s (fw %s, PROTO %s)" % (b.get("port") or port or "?",
+                                              b.get("fw"), b.get("proto"))
+    except GlowbugError:
+        pass
     print("glowbug %s · daemon %s · board %s" % (
         VERSION,
         "running" if daemon_ok else "stopped",
-        port or "not found"))
+        board))
 
 
 def doctor():
@@ -1685,6 +3114,40 @@ def doctor():
 # -------------------------------------------------------------------- rescue
 DFU_ID = "0483:df11"          # STM32 ROM bootloader, all families
 FW_RAW_URL = "https://raw.githubusercontent.com/pud/glowbug/main/firmware/glowbug.bin"
+
+# Flash map since fw 2.0.0: page 0 (2 KB at 0x08000000) is a resident
+# bootloader the daemon NEVER writes; the app lives at 0x08000800 and ends
+# where the settings page starts. An app image announces itself with the
+# manifest magic "GLWA" (47 4C 57 41) at offset 0xC0, right after its
+# 48-entry vector table.
+APP_FLASH_ADDR = 0x08000800
+APP_FLASH_END = 0x0800F800
+APP_MAGIC = b"GLWA"
+APP_MAGIC_OFFSET = 0xC0
+
+
+def check_app_image(path):
+    """None if `path` is a Glowbug APP image safe to flash at
+    APP_FLASH_ADDR, else the reason it is not. Refuses a whole-flash 1.4.x
+    image, a combined production image (both start with the bootloader's
+    vectors, not GLWA at 0xC0) and anything else that would overwrite
+    page 0 or land its reset vector outside the app region."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        return "unreadable (%s)" % e
+    if len(data) < APP_MAGIC_OFFSET + len(APP_MAGIC):
+        return "too small (%d bytes)" % len(data)
+    if data[APP_MAGIC_OFFSET:APP_MAGIC_OFFSET + len(APP_MAGIC)] != APP_MAGIC:
+        return 'no "GLWA" app magic at offset 0x%X' % APP_MAGIC_OFFSET
+    if len(data) > APP_FLASH_END - APP_FLASH_ADDR:
+        return "%d bytes does not fit the app region (%d)" % (
+            len(data), APP_FLASH_END - APP_FLASH_ADDR)
+    vec = int.from_bytes(data[4:8], "little") & ~1
+    if not APP_FLASH_ADDR <= vec < APP_FLASH_END:
+        return "reset vector 0x%08X is outside the app region" % vec
+    return None
 
 
 def _dfu_present():
@@ -1737,6 +3200,13 @@ def rescue():
                  "        %s\n\nthen re-run: glowbug rescue"
                  % (APP_DIR, APP_DIR, FW_RAW_URL))
     print("==> Firmware image: %s (fw %s)" % (fw, fw_ver))
+    why = check_app_image(fw)
+    if why:
+        sys.exit("Refusing to flash %s: %s.\n\n"
+                 "rescue writes only the APP region (0x%08X..) — page 0 is the\n"
+                 "bootloader and is never touched. Fetch the current app image:\n\n"
+                 "    curl -fsSL -o %s/firmware.bin %s\n\nthen re-run: glowbug rescue"
+                 % (fw, why, APP_FLASH_ADDR, APP_DIR, FW_RAW_URL))
 
     daemon_was_loaded = os.path.exists(PLIST_PATH)
     if daemon_was_loaded:
@@ -1749,11 +3219,7 @@ def rescue():
                 print("==> Glowbug found on %s — asking it to enter update mode"
                       % port)
                 try:
-                    fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-                    attrs = termios.tcgetattr(fd)
-                    attrs[0] = attrs[1] = attrs[3] = 0
-                    attrs[2] = termios.CREAD | termios.CLOCAL | termios.CS8
-                    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+                    fd = open_serial(port)
                     os.write(fd, b"DFU\n")
                     os.close(fd)
                 except OSError:
@@ -1778,7 +3244,8 @@ The middle screen will read RESCUE MODE. Waiting up to 60s...""")
         print("==> Rescue mode detected — writing firmware (~10s)...")
         try:
             r = subprocess.run(
-                ["dfu-util", "-a", "0", "-s", "0x08000000:leave", "-D", fw],
+                ["dfu-util", "-a", "0", "-s", "0x%08X:leave" % APP_FLASH_ADDR,
+                 "-D", fw],
                 capture_output=True, text=True, timeout=90)
             out = r.stdout + r.stderr
         except subprocess.TimeoutExpired as e:
@@ -1805,25 +3272,421 @@ The middle screen will read RESCUE MODE. Waiting up to 60s...""")
                            capture_output=True)
 
 
-def main():
-    arg = sys.argv[1] if len(sys.argv) > 1 else ""
-    if arg == "install":
-        install()
-    elif arg == "uninstall":
-        uninstall()
-    elif arg == "status":
-        status()
-    elif arg == "doctor":
-        doctor()
-    elif arg == "rescue":
-        rescue()
-    elif arg in ("--version", "version"):
+# --------------------------------------------------------- the Python API
+# `import glowbug; glowbug.show(3, color="green", line1="Build OK",
+# sound="ding", seconds=5)`. Every helper is one round trip to the daemon
+# over the unix socket and returns the reply dict; a refusal raises
+# GlowbugError(code, message). Language-neutral equivalent:
+#   printf '{"cmd":"show","screen":3,"color":"green","line1":"Build OK",
+#           "sound":"ding","for":5}\n' | nc -U "$HOME/Library/Application
+#           Support/Glowbug/daemon.sock"
+
+def _connect(timeout):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(SOCK_PATH)
+    except OSError as e:
+        s.close()
+        raise GlowbugError("no_daemon", "the Glowbug daemon isn't running (%s) — "
+                           "run: glowbug install" % e)
+    return s
+
+
+def _read_line(s, limit=SOCK_REQUEST_MAX):
+    """(first line, leftover bytes) from a socket; EOF ends the line."""
+    data = b""
+    while b"\n" not in data:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+        if len(data) > limit:
+            raise ValueError("reply too long")
+    line, _, rest = data.partition(b"\n")
+    return line, rest
+
+
+def _call(msg, timeout=5.0):
+    """One request dict -> the daemon's reply dict. Raises GlowbugError
+    with the daemon's code on ok:false, or "no_daemon" when nothing
+    answers on the socket."""
+    s = _connect(timeout)
+    try:
+        s.sendall((json.dumps(msg) + "\n").encode())
+        line, _ = _read_line(s)
+        if not line:
+            raise GlowbugError("no_daemon", "the daemon closed the connection "
+                               "without answering")
+        rep = json.loads(line.decode(errors="replace"))
+    except (OSError, ValueError) as e:
+        raise GlowbugError("no_daemon", "no answer from the daemon (%s)" % e)
+    finally:
+        s.close()
+    if not isinstance(rep, dict):
+        raise GlowbugError("no_daemon", "malformed reply from the daemon")
+    if "ok" not in rep:                       # a 1.5.0 daemon: report() only
+        raise GlowbugError("no_daemon", "the running daemon (%s) predates the API "
+                           "— run `glowbug install` to update it"
+                           % rep.get("version", "?"))
+    if not rep.get("ok"):
+        raise GlowbugError(rep.get("error") or "bad_request", rep.get("message") or "")
+    return rep
+
+
+def _req(cmd, **kw):
+    """A request dict: None and False arguments are omitted; `seconds`
+    becomes the wire's "for"."""
+    if "seconds" in kw:
+        kw["for"] = kw.pop("seconds")
+    msg = {"cmd": cmd}
+    for k, v in kw.items():
+        if v is not None and v is not False:
+            msg[k] = v
+    return msg
+
+
+def show(screen, color=None, mode=None, line1=None, line2=None, big=None,
+         sound=None, seconds=None, volume=None, to=None, period=None,
+         raw=False, no_led=False):
+    """Light screen 1-5 (or "all", or "1,3"): a color (palette name, #RGB,
+    RRGGBB) on its status LED, one or two text lines or one big line, a
+    sound, held for `seconds` (None = until released)."""
+    return _call(_req("show", screen=screen, color=color, mode=mode, line1=line1,
+                      line2=line2, big=big, sound=sound, seconds=seconds,
+                      volume=volume, to=to, period=period, raw=raw, no_led=no_led))
+
+
+def led(sel, color, mode=None, seconds=None, to=None, period=None,
+        fade_ms=None, raw=False):
+    """Color LEDs: 1-5 (status), ug1-ug5 (underglow), all/glass/ug or a
+    list; mode solid/fade/pulse/blink/off."""
+    return _call(_req("led", sel=sel, color=color, mode=mode, seconds=seconds,
+                      to=to, period=period, fade_ms=fade_ms, raw=raw))
+
+
+def text(screen, line1, line2=None, big=False, seconds=None):
+    """Text on screen 1-5 / all: two 21-char lines, or one big line."""
+    if big:
+        return _call(_req("text", screen=screen, big=line1, seconds=seconds))
+    return _call(_req("text", screen=screen, line1=line1, line2=line2,
+                      seconds=seconds))
+
+
+def sound(name_or_notes, volume=None):
+    """Play a named sound, "hz:ms,hz:ms,..." (hz 0 = rest), or "off"."""
+    return _call(_req("sound", sound=name_or_notes, volume=volume))
+
+
+def raw(*lines, **kw):
+    """Relay wire lines verbatim (PROTOCOL.md). raw("LED 0 SET FF0000",
+    confirm=True) waits for the board to parse them and raises board_err
+    with its ERR replies."""
+    return _call(_req("raw", lines=list(lines), confirm=kw.get("confirm", False)))
+
+
+def own(*resources, **kw):
+    """Claim "led:<sel>", "glass:<sel>", "sound", "enc" or "all", for
+    `seconds` (keyword) or until released."""
+    return _call(_req("own", resources=list(resources), seconds=kw.get("seconds")))
+
+
+def release(*resources):
+    """Release resources (none = everything this host owns)."""
+    return _call(_req("release", resources=list(resources) or None))
+
+
+def events(kinds=None, timeout=5.0):
+    """Generator of event dicts from the board and the daemon: enc, click,
+    hold, menu, own, set, err, hello, board, info, redraw, evt. `kinds`
+    filters. Runs until the daemon or the caller closes the socket."""
+    s = _connect(timeout)
+    try:
+        s.sendall((json.dumps(_req("events", filter=list(kinds) if kinds else None))
+                   + "\n").encode())
+        line, buf = _read_line(s)
+        rep = json.loads(line.decode(errors="replace")) if line else {}
+        if not rep.get("ok"):
+            raise GlowbugError(rep.get("error") or "no_daemon",
+                               rep.get("message") or "no events stream")
+        s.settimeout(None)
+        while True:
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if line.strip():
+                    yield json.loads(line.decode(errors="replace"))
+            chunk = s.recv(65536)
+            if not chunk:
+                return
+            buf += chunk
+    finally:
+        s.close()
+
+
+def info(fresh=False):
+    return _call(_req("info", fresh=fresh))
+
+
+def palette(reload=False):
+    return _call(_req("palette", reload=reload))
+
+
+def settings_get(key=None):
+    rep = _call(_req("settings", op="get", key=key))
+    return rep["settings"] if key is None else rep["settings"][key]
+
+
+def settings_set(key, value):
+    return _call({"cmd": "settings", "op": "set", "key": key, "value": value})["settings"][key]
+
+
+def settings_save():
+    _call(_req("settings", op="save"))
+    return True
+
+
+# ---------------------------------------------------------------- the CLI
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="glowbug",
+        description="Glowbug — a machined aluminum bar that shows your coding-agent "
+                    "sessions. With no command, runs the daemon.",
+        epilog="Colors: a palette name (glowbug palette), #RGB or RRGGBB. Sounds: "
+               "a name or hz:ms,hz:ms,... Screens and status LEDs are 1-5 left to "
+               "right, underglow ug1-ug5. Exit codes: 0 ok, 1 the daemon refused, "
+               "2 usage, 3 no daemon.")
+    p.add_argument("--version", action="version", version="glowbug %s" % VERSION)
+    sub = p.add_subparsers(dest="cmd", metavar="<command>")
+    for name, help_ in (("install", "set everything up (daemon, hooks, autostart)"),
+                        ("uninstall", "remove everything cleanly"),
+                        ("status", "one-line health check"),
+                        ("doctor", "verbose health check (paths, per-tool wiring)"),
+                        ("rescue", "reflash firmware (works even on a \"bricked\" board)"),
+                        ("version", "print the version")):
+        sub.add_parser(name, help=help_)
+
+    def api(name, help_):
+        sp = sub.add_parser(name, help=help_)
+        sp.add_argument("--json", action="store_true", help="print the daemon's reply as JSON")
+        return sp
+
+    def for_arg(sp):
+        sp.add_argument("--for", dest="seconds", type=float, metavar="SECONDS",
+                        help="release automatically after this long (0.05..86400)")
+
+    def mode_args(sp, with_fade):
+        sp.add_argument("--mode", choices=LED_MODES, help="solid (default), fade, pulse, blink, off")
+        sp.add_argument("--to", metavar="COLOR", help="pulse/blink: the other color (pulse: 30%% of the color)")
+        sp.add_argument("--period", type=int, metavar="MS", help="pulse/blink period (16..65535)")
+        if with_fade:
+            sp.add_argument("--fade-ms", dest="fade_ms", type=int, metavar="MS", help="fade time (default 700)")
+        sp.add_argument("--raw", action="store_true",
+                        help="send the color as-is instead of scaled by the board's brightness setting")
+
+    s = api("show", "light a screen: color, text, sound, hold time")
+    s.add_argument("screen", help="1-5 (left to right), a list like 1,3, or all")
+    s.add_argument("--color", "-c", metavar="COLOR")
+    mode_args(s, False)
+    s.add_argument("--line1", metavar="TEXT", help="top text line (21 chars)")
+    s.add_argument("--line2", metavar="TEXT", help="bottom text line")
+    s.add_argument("--big", metavar="TEXT", help="one big centered line instead")
+    s.add_argument("--sound", "-s", metavar="SOUND")
+    s.add_argument("--volume", type=int, choices=range(5), metavar="0-4")
+    for_arg(s)
+    s.add_argument("--no-led", dest="no_led", action="store_true", help="text only, leave the LED")
+
+    s = api("led", "color LEDs: 1-5, ug1-ug5, all, glass, ug")
+    s.add_argument("sel", help="LED selector, e.g. 3 / ug2 / 1,3,ug5 / all")
+    s.add_argument("color", help="palette name, #RGB or RRGGBB")
+    mode_args(s, True)
+    for_arg(s)
+
+    s = api("text", "text on a screen")
+    s.add_argument("screen", help="1-5, a list, or all")
+    s.add_argument("line1", help="top line (or the big line with --big)")
+    s.add_argument("line2", nargs="?", help="bottom line")
+    s.add_argument("--big", action="store_true", help="one big centered line")
+    for_arg(s)
+
+    s = api("sound", "play a sound")
+    s.add_argument("sound", help="a name, hz:ms,hz:ms,... (hz 0 = rest), or off")
+    s.add_argument("--volume", type=int, choices=range(5), metavar="0-4")
+
+    s = api("raw", "relay wire lines verbatim (see PROTOCOL.md)")
+    s.add_argument("lines", nargs="+", metavar="LINE", help='"LED 0 SET FF0000" ... or - for stdin')
+    s.add_argument("--confirm", action="store_true",
+                   help="wait until the board parsed them; fail with its ERR replies")
+
+    s = api("own", "claim resources: led:<sel> glass:<sel> sound enc all")
+    s.add_argument("resources", nargs="+", metavar="RES")
+    for_arg(s)
+
+    s = api("release", "release resources (none = everything)")
+    s.add_argument("resources", nargs="*", metavar="RES")
+
+    s = api("events", "stream board events as JSON lines")
+    s.add_argument("--filter", metavar="KINDS",
+                   help="comma list: enc,click,hold,menu,own,err,board,hello,set,info,redraw,evt")
+
+    api("info", "daemon + board capabilities, ownership")
+
+    s = api("palette", "list color and sound names")
+    s.add_argument("--reload", action="store_true", help="re-read ~/.glowbug/palette.json + sounds.json")
+
+    s = api("settings", "the board's user settings")
+    s.add_argument("op", choices=("get", "set", "save"))
+    s.add_argument("key", nargs="?", help="brightness ug_brightness ug_mode volume chime flip")
+    s.add_argument("value", nargs="?")
+    return p
+
+
+def _cli_request(args):
+    """Parsed CLI arguments -> the request dict the daemon gets."""
+    c = args.cmd
+    if c == "show":
+        return _req("show", screen=args.screen, color=args.color, mode=args.mode,
+                    to=args.to, period=args.period, line1=args.line1, line2=args.line2,
+                    big=args.big, sound=args.sound, volume=args.volume,
+                    seconds=args.seconds, no_led=args.no_led, raw=args.raw)
+    if c == "led":
+        return _req("led", sel=args.sel, color=args.color, mode=args.mode, to=args.to,
+                    period=args.period, fade_ms=args.fade_ms, seconds=args.seconds,
+                    raw=args.raw)
+    if c == "text":
+        if args.big:
+            return _req("text", screen=args.screen, big=args.line1, seconds=args.seconds)
+        return _req("text", screen=args.screen, line1=args.line1, line2=args.line2,
+                    seconds=args.seconds)
+    if c == "sound":
+        return _req("sound", sound=args.sound, volume=args.volume)
+    if c == "raw":
+        lines = args.lines
+        if lines == ["-"]:
+            lines = [l.rstrip("\r\n") for l in sys.stdin if l.strip()]
+        return _req("raw", lines=lines, confirm=args.confirm)
+    if c == "own":
+        return _req("own", resources=args.resources, seconds=args.seconds)
+    if c == "release":
+        return _req("release", resources=args.resources or None)
+    if c == "info":
+        return _req("info")
+    if c == "palette":
+        return _req("palette", reload=args.reload)
+    if c == "settings":
+        if args.op == "set" and args.value is None:
+            raise GlowbugError("bad_arg", "settings set needs <key> <value>")
+        if args.op == "save" and args.key is not None:
+            raise GlowbugError("bad_arg", "settings save takes no arguments")
+        msg = _req("settings", op=args.op, key=args.key)
+        if args.op == "set":
+            msg["value"] = args.value
+        return msg
+    raise GlowbugError("bad_arg", "unknown command %r" % c)
+
+
+def _human(cmd, rep):
+    """The one-line (or few-line) human form of a reply."""
+    if cmd == "info":
+        b = rep.get("board") or {}
+        o = rep.get("owned") or {}
+        out = ["daemon %s · api %s · %s" % (rep.get("daemon"), rep.get("api"),
+                                            rep.get("socket"))]
+        if b.get("online"):
+            out.append("board  fw %s · PROTO %s · %s" % (b.get("fw"), b.get("proto"),
+                                                        b.get("port")))
+            caps = " ".join("%s %s" % (k, b[k]) for k in
+                            ("leds", "glass", "ug", "screens", "w", "h", "pages",
+                             "fonts", "notes", "tonemax", "line", "slots", "stack",
+                             "txdrop", "up") if k in b)
+            if caps:
+                out.append("       " + caps)
+        else:
+            out.append("board  offline")
+        out.append("owned  led %s · glass %s · sound %s · enc %s" % (
+            ",".join(o.get("led") or []) or "-",
+            ",".join(str(g) for g in (o.get("glass") or [])) or "-",
+            "yes" if o.get("sound") else "no", "yes" if o.get("enc") else "no"))
+        st = rep.get("settings") or {}
+        if st:
+            out.append("board  " + " ".join("%s %s" % kv for kv in sorted(st.items())))
+        return "\n".join(out)
+    if cmd == "palette":
+        out = ["colors: " + " ".join("%s=%s" % kv for kv in sorted(rep["colors"].items())),
+               "sounds: " + " ".join(sorted(rep["sounds"]))]
+        out += ["warning: " + w for w in rep.get("warnings") or []]
+        return "\n".join(out)
+    if cmd == "settings":
+        if rep.get("saved"):
+            return "saved"
+        return "\n".join("%s %s" % kv for kv in sorted(rep["settings"].items()))
+    if cmd == "sound":
+        return "hushed" if rep.get("duration_ms") == 0 else "ok (%d ms)" % rep["duration_ms"]
+    n = len(rep.get("lines") or [])
+    s = "ok (%d line%s %s)" % (n, "" if n == 1 else "s",
+                               "confirmed" if rep.get("confirmed") else "queued")
+    if rep.get("held_until"):
+        s += " until %s" % time.strftime("%H:%M:%S", time.localtime(rep["held_until"]))
+    if rep.get("truncated"):
+        s += " — text clipped to %d chars" % TEXT_MAX
+    return s
+
+
+def _cli_events(args):
+    kinds = [k for k in (args.filter or "").split(",") if k] or None
+    try:
+        for ev in events(kinds):
+            sys.stdout.write(json.dumps(ev) + "\n")
+            sys.stdout.flush()
+    except KeyboardInterrupt:
+        return 0
+    except BrokenPipeError:                  # `glowbug events | head`
+        try:                                 # keep the exit-time flush quiet
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        return 0
+    except GlowbugError as e:
+        sys.stderr.write("glowbug: %s\n" % e.message)
+        return 3 if e.code == "no_daemon" else 1
+    return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if not argv:
+        run_daemon()                         # the LaunchAgent passes no args
+        return 0
+    parser = build_parser()
+    args = parser.parse_args(argv)           # bad usage: argparse exits 2
+    cmd = args.cmd
+    if cmd is None:
+        parser.print_usage(sys.stderr)
+        return 2
+    legacy = {"install": install, "uninstall": uninstall, "status": status,
+              "doctor": doctor, "rescue": rescue}
+    if cmd in legacy:
+        legacy[cmd]()
+        return 0
+    if cmd == "version":
         print("glowbug %s" % VERSION)
-    elif arg == "":
-        run_daemon()
+        return 0
+    if cmd == "events":
+        return _cli_events(args)
+    try:
+        req = _cli_request(args)
+    except GlowbugError as e:                # usage, caught before the daemon
+        parser.error(e.message)              # exits 2
+    try:
+        rep = _call(req)
+    except GlowbugError as e:
+        sys.stderr.write("glowbug: %s\n" % e.message)
+        return 3 if e.code == "no_daemon" else 1
+    if args.json:
+        print(json.dumps(rep, indent=2, sort_keys=True))
     else:
-        sys.exit(__doc__.strip())
+        print(_human(cmd, rep))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

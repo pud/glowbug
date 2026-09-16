@@ -46,6 +46,81 @@ the support matrix in the README. Cursor has no watch-only approval event
 
 ---
 
+## Using the API (`glowbug show`, `import glowbug`, the socket)
+
+The CLI prints the daemon's reason on stderr and exits 1; with `--json` the
+reply carries an `error` code. These are the codes and what they mean.
+
+**`proto_too_old`** — the board's firmware is older than 2.0.0 (it speaks
+PROTO 3; the API needs PROTO 4). Your agent display keeps working, the API
+doesn't. `glowbug info` shows the firmware and PROTO. Fix: `glowbug rescue`
+flashes the bundled image (needs `brew install dfu-util`) — see Rescue Mode
+below.
+
+**`no_board`** — the daemon is running but sees no Glowbug. Is it plugged
+in? `glowbug status` says what the Mac sees; a charge-only cable is the
+usual cause (next section). "the board went away" mid-request is the same
+thing: the port vanished while your lines were queued.
+
+**`no_daemon`** (exit 3) — nothing answered on the socket. The daemon isn't
+running: `glowbug install` starts it (and installs the LaunchAgent that
+keeps it running at login). If the message says **"the running daemon
+predates the API"**, an old 1.5.0 daemon answered — run `glowbug install`
+from the new tree; it replaces and restarts it. If you set `GLOWBUG_SOCK`,
+the daemon and your program must agree on it.
+
+**My text / light vanished** — five things end ownership; the reply's
+`held_until` and `glowbug info` (the `owned` line) tell you which:
+
+- `--for` ran out. That's the point of it.
+- **15 s of silence.** The board releases everything if it hears nothing
+  from the host for 15 s — the daemon pings it every second, so that means
+  the daemon stopped, restarted, or was upgraded, or the Mac slept. A
+  restarted daemon also starts the board with a clean session, so nothing
+  you painted before survives it: paint again.
+- **The board re-enumerated while the daemon kept running** (sleep/wake,
+  re-plug). The daemon replays what it still has — your claims with their
+  remaining time and the last color / text it sent to each LED and screen —
+  and sends a `redraw` event (`"reason": "hello"`). Streamed content (raw
+  `BLIT` frames, anything animated from the host) must be re-sent by you.
+- **The device menu** (a knob hold) borrows all five screens for up to 8 s.
+  When it closes the daemon repaints your screens (`redraw`, `"reason":
+  "menu"`); owned LEDs resume by themselves.
+- Something called `glowbug release` — with no arguments it releases
+  *everything*, from every program.
+
+**Another program keeps overwriting my LED** — ownership is one pool for
+every program on this Mac, not per program, so the last writer wins.
+Give each job its own screen, pass `--for` so signals expire instead of
+squatting, and watch `glowbug events --filter own` to see who claims what.
+
+**`busy`** — the daemon is protecting the board: its outgoing queue is full
+(the board isn't keeping up — ~25-30 full-board frames per second is the
+ceiling), 64 connections are already open, 16 event streams are already
+open, or your `events` reader let 256 events pile up (the stream ends with
+a `busy` line). Wait a moment and retry; slow your frame rate.
+
+**`timeout` / `board_err`** — `raw --confirm` and `settings` wait for the
+board to acknowledge. `timeout`: no answer within 1 s (the board is mid-blit
+or wedged — `glowbug info` shows `txdrop` and `up`). `board_err`: the board
+refused a line; the reply's `errors` list quotes its `ERR` replies (see
+PROTOCOL.md for the one-word reasons — `NOTOWNED`, `BUSY`, `range`, …).
+
+**My sound didn't play** — sounds are fire-and-forget, so a refusal shows
+up only as an event. Run `glowbug events --filter err` while you retry.
+`ERR SOUND muted` means the desk is set to silent: fix it with
+`glowbug settings set volume 2` (then `glowbug settings save` if you want
+it kept).
+
+**`glowbug events` is the debugging tool.** Run it in a second terminal
+while you drive the board: every claim and release (`own`), every refusal
+the board sends back (`err`), the knob (`enc`, `click`, `hold`), the menu
+opening and closing (`menu`), the board coming and going (`board`), and the
+daemon's own repaints (`redraw`). `glowbug events --filter err,own` is the
+usual pair.
+
+---
+
 ## My Glowbug is dark and my Mac doesn't see it
 
 **First, the boring checks:**
@@ -93,6 +168,16 @@ glowbug rescue
 
 That reinstalls the last known-good firmware. About ten seconds later, the
 welcome animation plays and you're back to normal.
+
+Since firmware 2.0.0 the first 2 KB of the chip (page 0) hold a small
+resident bootloader, and `glowbug rescue` never writes there — it flashes
+only the app region that starts right after it. Before it touches the board
+it checks the image: a file that isn't a Glowbug **app** image (no `GLWA`
+mark at offset `0xC0`, or a reset vector outside the app region) is refused
+with `Refusing to flash … page 0 is the bootloader and is never touched`,
+and nothing is written. The old whole-flash 1.4.x `glowbug.bin` is refused
+for the same reason; the message includes the `curl` line that fetches the
+current app image into `~/.glowbug/firmware.bin`.
 
 ---
 
