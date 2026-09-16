@@ -88,6 +88,7 @@ Glowbug daemon listens to these hooks and tells the Glowbug device what to do
   working directory, tool name, error type, which tool, idle flag. Never your
   prompts, never tool arguments, never file contents.
 - The device only ever gets a session's name and one status word.
+- The physical Glowbug device is not connected to the internet.
 
 ## If something goes wrong
 
