@@ -2,6 +2,8 @@
 
 ![Glowbug](docs/glowbug.png)
 
+[![Buy a Glowbug](docs/buy.svg)](https://glowbug.dev)
+
 ## What is it?
 
 Glowbug is a robot (if you can call it that) that connects to your computer
@@ -78,7 +80,9 @@ any language. Reference: [API.md](API.md). Scripts to start from:
 
 ## How do I set it up?
 
-First you need a Glowbug: https://glowbug.dev.
+First you need a Glowbug:
+
+[![Buy a Glowbug](docs/buy.svg)](https://glowbug.dev)
 
 Then the software. Any of these:
 
