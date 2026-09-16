@@ -14,10 +14,23 @@ writing messages on its 5 OLED screens.
 
 - [<ins>Buy a Glowbug device</ins>](https://glowbug.dev)
 - Install the software, any of these ways:
-  - Tell Claude Code: `Install glowbug from github.com/pud/glowbug`
-  - `brew install pud-blip/tap/glowbug && glowbug install`
-  - `pipx install glowbug && glowbug install`
-  - `git clone https://github.com/pud/glowbug && cd glowbug && python3 glowbug.py install`
+
+  Tell Claude Code:
+  ```
+  Install glowbug from github.com/pud/glowbug
+  ```
+  Homebrew:
+  ```sh
+  brew install pud-blip/tap/glowbug && glowbug install
+  ```
+  pipx:
+  ```sh
+  pipx install glowbug && glowbug install
+  ```
+  From source:
+  ```sh
+  git clone https://github.com/pud/glowbug && cd glowbug && python3 glowbug.py install
+  ```
 - Plug in the Glowbug and restart any agent sessions you already had open.
   `glowbug status` tells you if it's healthy.
 
