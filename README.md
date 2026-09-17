@@ -6,9 +6,12 @@
 
 ## What is Glowbug?
 
-Glowbug is a device that helps AI coding agents get your attention. Claude
-Code can make the Glowbug next to your computer BEEP loudly, beep quietly,
-shine brightly, change colors, and write messages on its 5 OLED displays.
+Glowbug is a device that helps your AI coding agents get your attention.
+
+The Glowbug next to your computer will BEEP and LIGHT UP when your agent is
+done or has a question. It can be loud, quiet, bright, dim and colorful. And
+it can tell you messages on its 5 OLED displays, like which agent needs
+attention and what's the status of everything.
 
 ## How do I set it up?
 
