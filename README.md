@@ -12,13 +12,13 @@ shine brightly, change colors, and write messages on its 5 OLED displays.
 
 ## How do I set it up?
 
-![Step 1 of 3](docs/step1.svg)
+![Step 1 of 3](docs/step1-of-3.svg)
 
 **[<ins>Buy a Glowbug device</ins>](https://glowbug.dev)**
 
 <br>
 
-![Step 2 of 3](docs/step2.svg)
+![Step 2 of 3](docs/step2-of-3.svg)
 
 **Install the software.** Pick one:
 
@@ -42,7 +42,7 @@ cd glowbug && python3 glowbug.py install
 
 <br>
 
-![Step 3 of 3](docs/step3.svg)
+![Step 3 of 3](docs/step3-of-3.svg)
 
 **Plug in the Glowbug.** Restart any agent sessions you already had open.
 `glowbug status` tells you if it's healthy.
