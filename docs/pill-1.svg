@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="132" height="56" viewBox="0 0 132 56" role="img" aria-label="Step 1 of 3">
+  <defs>
+    <filter id="blur" x="-30%" y="-50%" width="160%" height="200%">
+      <feGaussianBlur stdDeviation="5"/>
+    </filter>
+  </defs>
+  <rect x="-3" y="11" width="118" height="32" rx="16" fill="#8b5cf6" filter="url(#blur)" opacity="0.22">
+    <animate attributeName="opacity" values="0.22;0.8;0.22" dur="2.8s" begin="-0.0s" repeatCount="indefinite" calcMode="spline" keySplines="0.42 0 0.58 1;0.42 0 0.58 1"/>
+  </rect>
+  <rect x="0.5" y="14.5" width="111" height="25" rx="12.5" fill="#444c56" stroke="#6e7681" stroke-width="1"/>
+  <text x="56" y="31.5" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" letter-spacing="1" fill="#ffffff">STEP 1 OF 3</text>
+</svg>
