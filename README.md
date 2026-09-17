@@ -49,8 +49,8 @@ Codex ────────┤
 Antigravity ──┘
 ```
 
-The AI tools you use already announce what they're doing via hooks. The
-Glowbug daemon listens to these hooks and tells the Glowbug device what to do
+The AI tools you use already announce what they're doing via hooks. Glowbug
+listens to these hooks and tells the Glowbug device what to do
 (what lights to light up, which colors, etc).
 
 ## What it can see
