@@ -12,13 +12,13 @@ writing messages on its 5 OLED screens.
 
 ## How do I set it up?
 
-![Step 1 of 3](docs/step1-glow.svg)
+![Step 1 of 3](docs/step1.svg)
 
 **[<ins>Buy a Glowbug device</ins>](https://glowbug.dev)**
 
 <br>
 
-![Step 2 of 3](docs/step2-glow.svg)
+![Step 2 of 3](docs/step2.svg)
 
 **Install the software.** Pick one:
 
@@ -42,7 +42,7 @@ cd glowbug && python3 glowbug.py install
 
 <br>
 
-![Step 3 of 3](docs/step3-glow.svg)
+![Step 3 of 3](docs/step3.svg)
 
 **Plug in the Glowbug.** Restart any agent sessions you already had open.
 `glowbug status` tells you if it's healthy.
