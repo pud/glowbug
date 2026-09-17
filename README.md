@@ -12,30 +12,36 @@ writing messages on its 5 OLED screens.
 
 ## How do I set it up?
 
-1. **[<ins>Buy a Glowbug device</ins>](https://glowbug.dev)**
+![Step 1 of 3](docs/step-1.svg)
 
-2. **Install the software.** Pick one:
+**[<ins>Buy a Glowbug device</ins>](https://glowbug.dev)**
 
-   - Tell your coding agent (Claude Code, etc.):
-     ```
-     Install glowbug from github.com/pud/glowbug
-     ```
-   - Homebrew:
-     ```sh
-     brew install pud-blip/tap/glowbug && glowbug install
-     ```
-   - pipx:
-     ```sh
-     pipx install glowbug && glowbug install
-     ```
-   - From source:
-     ```sh
-     git clone https://github.com/pud/glowbug
-     cd glowbug && python3 glowbug.py install
-     ```
+![Step 2 of 3](docs/step-2.svg)
 
-3. **Plug in the Glowbug.** Restart any agent sessions you already had open.
-   `glowbug status` tells you if it's healthy.
+**Install the software.** Pick one:
+
+Tell your coding agent (Claude Code, etc.):
+```
+Install glowbug from github.com/pud/glowbug
+```
+Homebrew:
+```sh
+brew install pud-blip/tap/glowbug && glowbug install
+```
+pipx:
+```sh
+pipx install glowbug && glowbug install
+```
+From source:
+```sh
+git clone https://github.com/pud/glowbug
+cd glowbug && python3 glowbug.py install
+```
+
+![Step 3 of 3](docs/step-3.svg)
+
+**Plug in the Glowbug.** Restart any agent sessions you already had open.
+`glowbug status` tells you if it's healthy.
 
 ## How does it work?
 
