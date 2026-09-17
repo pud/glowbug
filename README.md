@@ -16,6 +16,8 @@ writing messages on its 5 OLED screens.
 
 **[<ins>Buy a Glowbug device</ins>](https://glowbug.dev)**
 
+<br>
+
 ![Step 2 of 3](docs/step-2.svg)
 
 **Install the software.** Pick one:
@@ -37,6 +39,8 @@ From source:
 git clone https://github.com/pud/glowbug
 cd glowbug && python3 glowbug.py install
 ```
+
+<br>
 
 ![Step 3 of 3](docs/step-3.svg)
 
