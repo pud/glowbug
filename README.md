@@ -6,9 +6,9 @@
 
 ## What is Glowbug?
 
-Glowbug is a device that enables AI coding agents (Claude Code, Codex,
-Cursor, etc.) to get your attention by beeping, flashing, changing color, and
-writing messages on its 5 OLED screens.
+Glowbug is a device that helps AI coding agents get your attention. Claude
+Code can make the Glowbug next to your computer BEEP loudly, beep quietly,
+shine brightly, change colors, and write messages on its 5 OLED displays.
 
 ## How do I set it up?
 
