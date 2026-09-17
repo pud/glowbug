@@ -30,7 +30,8 @@ writing messages on its 5 OLED screens.
      ```
    - From source:
      ```sh
-     git clone https://github.com/pud/glowbug && cd glowbug && python3 glowbug.py install
+     git clone https://github.com/pud/glowbug
+     cd glowbug && python3 glowbug.py install
      ```
 
 3. **Plug in the Glowbug.** Restart any agent sessions you already had open.
