@@ -6,9 +6,9 @@
 
 ## What is Glowbug?
 
-Glowbug is a good lookin' device that sits next to your computer. It lets
-your AI coding agents get your attention with beeps, bloops, lights, colors,
-and 5 OLED displays.
+Glowbug is a good lookin' device that sits next to your computer. It
+automatically helps your AI coding agents get your attention with beeps,
+bloops, lights, colors, and 5 OLED displays.
 
 At a glance you'll know what each agent is working on, and you'll know
 instantly when an agent is finished or has a question for you.
