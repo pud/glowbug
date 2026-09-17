@@ -15,13 +15,13 @@ instantly when an agent is finished or has a question for you.
 
 ## How do I set it up?
 
-![Step 1 of 3](docs/pill-1.svg)
+![Step 1 of 2](docs/pill-1of2.svg)
 
-**[<ins>Buy a Glowbug device</ins>](https://glowbug.dev)**
+**[<ins>Buy a Glowbug device</ins>](https://glowbug.dev)** and plug it into your computer.
 
 <br>
 
-![Step 2 of 3](docs/pill-2.svg)
+![Step 2 of 2](docs/pill-2of2.svg)
 
 **Install the software.** Pick one:
 
@@ -43,12 +43,8 @@ git clone https://github.com/pud/glowbug
 cd glowbug && python3 glowbug.py install
 ```
 
-<br>
-
-![Step 3 of 3](docs/pill-3.svg)
-
-**Plug in the Glowbug.** Restart any agent sessions you already had open.
-`glowbug status` tells you if it's healthy.
+Restart any agent sessions you already had open. `glowbug status` tells you
+if it's healthy.
 
 ## How does it work?
 
