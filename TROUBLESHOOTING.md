@@ -54,6 +54,14 @@ The dashes are honest gaps — those tools don't have a safe event for that
 moment. Cursor has no watch-only approval event (no pink light), and Codex
 has no failure event (no red).
 
+**My agent shows on a screen but its light never comes on.** Fixed in
+2.1.1 — upgrade (`brew upgrade glowbug` or `pipx upgrade glowbug`, then
+`glowbug install`). Claude Code in a terminal publishes a busy/idle status
+Glowbug can read; the Claude **desktop** app registers its session without
+one, and older daemons trusted that silence as "idle forever", so the
+session got a name and a screen but stayed dark. The daemon now falls back
+to the session's hooks whenever the status is missing.
+
 ---
 
 ## Using the API (`glowbug show`, `import glowbug`, the socket)

@@ -12,6 +12,7 @@ created/born_at/last_seen with time.time() (glowbug.py Session.__init__)
 and display_state()/assign_slots() read it back, so nothing here sleeps.
 """
 
+import json
 import os
 import select
 import sys
@@ -722,6 +723,95 @@ class TablesTests(unittest.TestCase):
         self.assertEqual((glowbug.NOTES_MAX, glowbug.TONE_HZ_MIN,
                           glowbug.TONE_HZ_MAX, glowbug.TONE_MS_MAX),
                          (32, 50, 20000, 5000))
+
+
+# ------------------------------------ the Claude DESKTOP app (no "status")
+class StatuslessRegistryTests(GlowbugCase):
+    """Claude Code's CLI stamps "status": busy|waiting|idle into its registry
+    entry; the Claude desktop app (entrypoint "claude-desktop") writes an
+    entry with no status field at all (bench 2026-09-19 — the session showed
+    on a screen but its LED never lit). A status-less registrar must fall
+    back to the hooks, exactly like Cursor/Codex do."""
+
+    def write_entry(self, sid, **extra):
+        os.makedirs(glowbug.SESSIONS_DIR, exist_ok=True)
+        d = {"pid": os.getpid(), "sessionId": sid, "cwd": "/tmp/proj",
+             "startedAt": 1_700_000_000_000, "kind": "interactive",
+             "name": "myproject"}
+        d.update(extra)
+        with open(os.path.join(glowbug.SESSIONS_DIR, sid[:8] + ".json"),
+                  "w") as f:
+            json.dump(d, f)
+
+    def test_read_registry_reports_whether_status_exists(self):
+        self.write_entry("cli00000-0000", entrypoint="cli", status="busy")
+        self.write_entry("desk0000-0000", entrypoint="claude-desktop")
+        reg = glowbug.read_registry()
+        self.assertTrue(reg["cli00000-0000"]["has_status"])
+        self.assertTrue(reg["cli00000-0000"]["busy"])
+        self.assertFalse(reg["desk0000-0000"]["has_status"])
+        self.assertFalse(reg["desk0000-0000"]["busy"])
+
+    def test_desktop_session_is_thinking_from_its_hooks(self):
+        d = glowbug.Daemon()
+        self.write_entry("desk0000-0000", entrypoint="claude-desktop")
+        d.poll_claude_registry()
+        s = d.sessions[("claude", "desk0000-0000")]
+        self.assertFalse(s.reg_status)
+        self.clock.advance(2.0)                   # past "arriving"
+        self.assertEqual(s.display_state(), "idle")
+        d.handle_hook({"hook_event_name": "UserPromptSubmit", "session_id": "desk0000-0000"})
+        self.assertEqual(s.display_state(), "thinking")
+        # a tool event alone is enough too (the daemon can restart mid-turn
+        # and never see that turn's UserPromptSubmit)
+        s.hook_state = "idle"
+        d.handle_hook({"hook_event_name": "PostToolUse", "session_id": "desk0000-0000",
+                       "tool_name": "Bash"})
+        self.assertEqual(s.display_state(), "thinking")
+        d.handle_hook({"hook_event_name": "PostToolUse", "session_id": "desk0000-0000",
+                       "tool_name": "Bash"})
+        self.assertEqual(s.display_state(), "thinking")
+        # a registry poll must not undo it (the entry says nothing about busy)
+        d.poll_claude_registry()
+        self.assertEqual(s.display_state(), "thinking")
+        # Stop ends the turn AND starts the green celebration, which normally
+        # rides the registry's busy -> idle edge
+        d.handle_hook({"hook_event_name": "Stop", "session_id": "desk0000-0000"})
+        self.assertEqual(s.display_state(), "done")
+        self.clock.advance(glowbug.DONE_S + 0.1)
+        self.assertEqual(s.display_state(), "idle")
+
+    def test_desktop_permission_prompt_outlives_the_3s_registry_handoff(self):
+        d = glowbug.Daemon()
+        self.write_entry("desk0000-0000", entrypoint="claude-desktop")
+        d.poll_claude_registry()
+        s = d.sessions[("claude", "desk0000-0000")]
+        self.clock.advance(2.0)
+        d.handle_hook({"hook_event_name": "PermissionRequest", "session_id": "desk0000-0000",
+                       "tool_name": "Bash"})
+        self.assertEqual(s.display_state(), "permission")
+        self.clock.advance(30.0)                  # no registry "waiting" ever
+        d.poll_claude_registry()
+        self.assertEqual(s.display_state(), "permission")
+        d.handle_hook({"hook_event_name": "PostToolUse", "session_id": "desk0000-0000",
+                       "tool_name": "Bash"})
+        self.assertEqual(s.display_state(), "thinking")
+
+    def test_cli_session_still_follows_the_registry(self):
+        d = glowbug.Daemon()
+        self.write_entry("cli00000-0000", entrypoint="cli", status="busy")
+        d.poll_claude_registry()
+        s = d.sessions[("claude", "cli00000-0000")]
+        self.assertTrue(s.reg_status)
+        self.clock.advance(2.0)
+        self.assertEqual(s.display_state(), "thinking")
+        # hook says "working", registry says idle -> registry wins (unchanged)
+        self.write_entry("cli00000-0000", entrypoint="cli", status="idle")
+        d.poll_claude_registry()
+        s.hook_state, s.activity_at = "working", self.clock.now
+        self.assertEqual(s.display_state(), "done")   # busy -> idle edge
+        self.clock.advance(glowbug.DONE_S + 0.1)
+        self.assertEqual(s.display_state(), "idle")
 
 
 if __name__ == "__main__":

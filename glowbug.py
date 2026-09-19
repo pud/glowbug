@@ -46,7 +46,7 @@ import threading
 import time
 import traceback
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 NUM_SLOTS = 5                        # pre-negotiation window (old boards show 5)
 BOARD_SLOTS_MAX = 32                 # protocol v3 cap: fw 1.4.0+ advertises
                                      # "EVT HELLO <fw> PROTO 3 SLOTS 32"; the
@@ -1150,6 +1150,13 @@ class Session:
                                       # never given a screen.
         self.busy = False            # registry status == "busy"
         self.reg_waiting = False     # registry status == "waiting" (dialog open)
+        self.reg_status = True       # does this session's registrar publish a
+                                     # "status" field at all? The Claude
+                                     # DESKTOP app writes a registry entry with
+                                     # no status ever (bench 2026-09-19), so a
+                                     # desktop session's busy/idle has to come
+                                     # from its hooks, exactly like every
+                                     # non-Claude source. Set per poll.
         self.hook_state = "idle"     # idle | working | waiting | error
         self.waiting_at = 0.0        # when a hook last raised "waiting"
         self.done_at = 0.0           # when the agent last finished a turn —
@@ -1183,7 +1190,8 @@ class Session:
         # question (AskUserQuestion dialog) vs permission (a gated tool) —
         # the PermissionRequest hook's tool_name is the discriminator.
         if self.reg_waiting or (self.hook_state == "waiting"
-                                and time.time() - self.waiting_at < 3.0):
+                                and (not self.reg_status
+                                     or time.time() - self.waiting_at < 3.0)):
             if self.detail and self.detail != "AskUserQuestion":
                 return "permission"
             return "question"
@@ -1197,7 +1205,8 @@ class Session:
         # only their hooks to go on: a turn is "working" from the first event
         # until the tool says it stopped. reap_stale() is the safety net for a
         # session that dies without ever sending that stop event.
-        if self.source != "claude" and self.hook_state == "working" \
+        if (self.source != "claude" or not self.reg_status) \
+                and self.hook_state == "working" \
                 and time.time() - self.activity_at < WORK_STALE_S:
             return "thinking"
         if time.time() - self.done_at < DONE_S:
@@ -1232,6 +1241,9 @@ def read_registry():
                                 or d.get("kind") == "bg"),
                 "busy": d.get("status") == "busy",
                 "waiting": d.get("status") == "waiting",
+                # no status key = a status-less registrar (Claude desktop):
+                # never let its permanent "not busy" outvote the hooks
+                "has_status": "status" in d,
                 "created": d.get("startedAt", 0) / 1000.0,   # ms epoch -> s
             }
         except (OSError, ValueError, TypeError, KeyError):
@@ -1482,8 +1494,10 @@ class Daemon:
                     s.done_at = time.time()
                 s.name, s.cwd, s.busy, s.alive = info["name"], info["cwd"], info["busy"], True
                 s.reg_waiting = info["waiting"]
+                s.reg_status = info["has_status"]
                 s.is_subagent = info["is_subagent"]
-                if s.hook_state == "waiting" and not info["waiting"] and \
+                if s.reg_status and s.hook_state == "waiting" \
+                        and not info["waiting"] and \
                         time.time() - s.waiting_at >= 3.0:
                     s.hook_state = "idle"        # dialog gone: dismissed or answered
                     s.detail = ""
@@ -1691,6 +1705,8 @@ class Daemon:
                 # flashes onto a screen for the poll-lag window
                 s.is_subagent = bool(
                     self.last_reg.get(sid, {}).get("is_subagent"))
+                s.reg_status = bool(
+                    self.last_reg.get(sid, {}).get("has_status"))
             s.last_seen = s.activity_at = time.time()
             if name == "UserPromptSubmit":
                 s.hook_state = "working"
@@ -1699,9 +1715,17 @@ class Daemon:
                 s.waiting_at = time.time()
                 s.detail = ev.get("tool_name", "")
             elif name == "PostToolUse":
-                if s.hook_state == "waiting":
+                if s.hook_state != "error":
+                    # any tool activity = a live turn. The CLI's registry
+                    # says the same thing a beat later, but a status-less
+                    # registrar (desktop) has nothing else to go on — and
+                    # this is also what re-lights a turn the daemon missed
+                    # the UserPromptSubmit for (restarted mid-turn).
                     s.hook_state = "working"
             elif name == "Stop":
+                if not s.reg_status and s.hook_state in ("working", "waiting"):
+                    s.done_at = time.time()   # no registry busy->idle edge to
+                                              # start the green celebration
                 s.hook_state = "idle"
                 s.detail = ""
             elif name == "StopFailure":
